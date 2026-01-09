@@ -387,8 +387,10 @@ def python_extract_summary_strict(azure_result):
     
 def python_extract_summary_text_fallback(full_text):
     """
-    Python 總表提取 (B計畫)：純文字 Regex 版
-    用途：當沒有 Azure 原始物件 (如讀取舊 JSON) 時，嘗試從文字中硬抓。
+    Python 總表提取 (B計畫 - 雙模升級版)：Regex
+    用途：
+    1. 支援「OCR 純文字」 (舊 JSON / 圖片文字)。
+    2. 支援「Excel Markdown」 (有 | 符號分隔的表格)。
     """
     import re
     header_info = {}
@@ -397,37 +399,45 @@ def python_extract_summary_text_fallback(full_text):
     if not full_text: return header_info, summary_rows
 
     # 1. 抓工令 (W/R/O/Y 開頭)
-    job_match = re.search(r"工令編號[:：\s]*([WROY]\w+)", full_text, re.IGNORECASE)
+    # 不管是純文字還是表格內的工令，通常格式都是 "工令編號:W..."，這行不用改
+    job_match = re.search(r"工令編號[:：\s\|]*([WROY]\w+)", full_text, re.IGNORECASE)
     if job_match: header_info["job_no"] = job_match.group(1).strip()
 
-    # 2. 抓每一行總表數據
-    # 邏輯：找行首是數字 -> 中間是文字 -> 單位(PC/SET...) -> 數字(申請) -> 數字(實交)
-    # 例如： "1 W3 #1機ROLL銲補 PC 13 13 ..."
+    # 2. 抓每一行總表數據 (升級 Regex)
+    # 兼容格式 A (OCR): "1  W3名稱  PC  13  13"
+    # 兼容格式 B (Excel): "| 1 | W3名稱 | PC | 13 | 13 |"
     
-    # 定義單位白名單 (可自行擴充)
+    # 定義單位白名單
     units = r"(PC|SET|EA|UNIT|KG|M|組|件|式|台|顆)"
     
-    # Regex 解析模式
-    # Group 1: 項次 (數字)
-    # Group 2: 名稱 (非貪婪匹配)
+    # 🚀 升級後的 Regex：在每個欄位之間加入 `\s*\|?\s*` (允許空白或直槓)
+    # Group 1: 項次
+    # Group 2: 名稱
     # Group 3: 單位
     # Group 4: 申請數量
     # Group 5: 實交數量
-    # Group 6: 後面剩下的 (日期等)
-    pattern = re.compile(rf"^\s*(\d+)\s+(.+?)\s+{units}\s+(\d+)\s+(\d+)(.*)", re.MULTILINE)
+    pattern = re.compile(
+        rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # 行首 + 可選直槓 + 項次(數字) + 分隔
+        rf"(.+?)\s*\|?\s*"                # 名稱 + 分隔
+        rf"{units}\s*\|?\s*"              # 單位 + 分隔
+        rf"(\d+)\s*\|?\s*"                # 申請數量 + 分隔
+        rf"(\d+)"                         # 實交數量
+        rf"(.*)",                         # 後面剩下的 (日期等)
+        re.MULTILINE
+    )
     
     matches = pattern.findall(full_text)
     
     for m in matches:
         try:
             idx = int(m[0])
-            name = m[1].strip()
+            name = m[1].strip().replace("|", "") # 保險起見，把名稱裡可能殘留的 | 去掉
             # 單位 m[2]
             q_apply = int(m[3])
             q_deliver = int(m[4])
             tail = m[5]
             
-            # 嘗試從尾巴抓日期 (格式 113.01.20 或 2024/01/20)
+            # 抓日期 (格式 113.01.20 或 2024/01/20)
             dates = re.findall(r"(\d{2,4}[./]\d{1,2}[./]\d{1,2})", tail)
             sched = dates[0] if len(dates) > 0 else ""
             act = dates[1] if len(dates) > 1 else ""
