@@ -387,10 +387,11 @@ def python_extract_summary_strict(azure_result):
     
 def python_extract_summary_text_fallback(photo_gallery_items):
     """
-    Python 總表提取 (B計畫 - V5 終極版)：
-    1. 支援「多頁」總表 (遍歷所有頁面)。
-    2. 支援「空值」數量 (實交數量沒填也能抓)。
-    3. 支援「含空格」日期 (113 . 01 . 01 也能抓)。
+    Python 總表提取 (B計畫 - V6 雙階段智能版)：
+    解決痛點：
+    1. 解決「2 2」被黏成「22」的問題 (改用 Split 邏輯)。
+    2. 解決「數量」誤抓到「日期年份」的問題 (先挖掉日期)。
+    3. 支援多頁掃描。
     """
     import re
     header_info = {}
@@ -398,70 +399,87 @@ def python_extract_summary_text_fallback(photo_gallery_items):
     
     if not photo_gallery_items: return header_info, summary_rows
 
-    # 1. 抓工令 (通常在第一頁，但我們還是掃描一下前幾頁比較保險)
-    # 我們只看前 2 頁來找工令，避免誤判
+    # 1. 抓工令 (掃描前兩頁)
     for i in range(min(2, len(photo_gallery_items))):
         full_text = photo_gallery_items[i].get('full_text', '')
         job_match = re.search(r"工令編號[:：\s\|]*([WROY]\w+)", full_text, re.IGNORECASE)
         if job_match: 
             header_info["job_no"] = job_match.group(1).strip()
-            break # 抓到就停
+            break 
 
-    # 2. 抓總表數據 (遍歷每一頁)
-    # 定義單位白名單
+    # 2. 定義解析邏輯
+    # 單位白名單
     units = r"(PC|SET|EA|UNIT|KG|M|組|件|式|台|顆)"
     
-    # 🚀 升級 Regex：
-    # - 數量欄位改用 [\d\s]* (允許數字或空白)，避免因為空值而抓到後面的字
-    # - 日期部分改為 tail 解析
-    pattern = re.compile(
-        rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # Group 1: 項次 (數字)
+    # 步驟 1: 先定位「行首」到「單位」為止
+    # 我們只抓前半段，後半段 (數量+日期) 留給第二階段處理
+    pattern_head = re.compile(
+        rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # Group 1: 項次
         rf"(.+?)\s*\|?\s*"                # Group 2: 名稱
-        rf"{units}\s*\|?\s*"              # Group 3: 單位
-        rf"([\d\s]*)\s*\|?\s*"            # Group 4: 申請數量 (允許空)
-        rf"([\d\s]*)"                     # Group 5: 實交數量 (允許空)
-        rf"(.*)",                         # Group 6: 尾巴 (找日期)
-        re.MULTILINE
+        rf"{units}\s*\|?"                 # Group 3: 單位 (遇到單位就停)
+        , re.MULTILINE
     )
 
     for page_idx, item in enumerate(photo_gallery_items):
         full_text = item.get('full_text', '')
         if not full_text: continue
         
-        matches = pattern.findall(full_text)
-        
-        for m in matches:
+        # 逐行掃描
+        for match in pattern_head.finditer(full_text):
             try:
-                # 1. 基礎欄位清洗
-                idx_str = m[0].strip()
-                name = m[1].strip().replace("|", "")
-                unit = m[2].strip()
+                # --- A. 基礎資訊提取 ---
+                idx_str = match.group(1).strip()
+                name = match.group(2).strip().replace("|", "")
+                unit = match.group(3).strip()
                 
-                # [過濾] 如果名稱本身就是純數字 (例如 "0")，通常是 OCR 錯位或頁碼雜訊 -> 跳過
-                if name.isdigit() or len(name) < 2: 
-                    continue
+                # 過濾雜訊
+                if name.isdigit() or len(name) < 2: continue
 
-                # 2. 數量清洗 (處理空格)
-                q_apply_str = re.sub(r"\D", "", m[3]) # 只留數字
-                q_deliver_str = re.sub(r"\D", "", m[4])
+                # --- B. 取得後半段字串 (包含數量與日期) ---
+                # match.end() 是單位結束的位置，我們抓這之後的所有文字直到行尾
+                line_start = match.end()
+                line_end = full_text.find('\n', line_start)
+                if line_end == -1: line_end = len(full_text)
                 
-                q_apply = int(q_apply_str) if q_apply_str else 0
-                q_deliver = int(q_deliver_str) if q_deliver_str else 0
+                tail_str = full_text[line_start:line_end].strip()
                 
-                # 3. 日期清洗 (升級版 Regex，允許空格)
-                tail = m[5]
-                # 抓取像是 113.01.20, 113 . 1 . 20, 2024/01/20
-                dates = re.findall(r"(\d{2,4}\s*[./]\s*\d{1,2}\s*[./]\s*\d{1,2})", tail)
+                # --- C. 第一刀：先把日期挖出來 (Date Extraction) ---
+                # Regex: 抓取 113.01.01 或 2024/05/20 (允許有空格)
+                date_pattern = r"(\d{2,4}\s*[./]\s*\d{1,2}\s*[./]\s*\d{1,2})"
+                dates = re.findall(date_pattern, tail_str)
                 
-                # 移除日期字串裡的空格，標準化格式
                 clean_dates = [d.replace(" ", "") for d in dates]
-                
                 sched = clean_dates[0] if len(clean_dates) > 0 else ""
                 act = clean_dates[1] if len(clean_dates) > 1 else ""
                 
-                # 4. 存入結果
+                # 🔥 關鍵動作：把找到的日期從字串中「刪除」，避免干擾數量
+                # 我們用 sub 把日期換成空格
+                qty_str_only = re.sub(date_pattern, "", tail_str)
+                
+                # --- D. 第二刀：剩下的就是數量 (Quantity Extraction) ---
+                # 移除 | 符號，只留數字
+                qty_str_clean = qty_str_only.replace("|", " ")
+                # 抓取所有剩下的數字塊
+                numbers = re.findall(r"\d+", qty_str_clean)
+                
+                q_apply = 0
+                q_deliver = 0
+                
+                if len(numbers) >= 2:
+                    # 如果抓到兩個數字 -> 第一個是申請，第二個是實交
+                    q_apply = int(numbers[0])
+                    q_deliver = int(numbers[1])
+                elif len(numbers) == 1:
+                    # 如果只抓到一個數字 -> 通常是申請數量，實交為 0
+                    q_apply = int(numbers[0])
+                    q_deliver = 0
+                else:
+                    # 都沒抓到 -> 0, 0
+                    pass
+                
+                # --- E. 存檔 ---
                 summary_rows.append({
-                    "page": page_idx + 1, # 真實頁碼
+                    "page": page_idx + 1,
                     "index": int(idx_str),
                     "title": name,
                     "apply_qty": q_apply,
@@ -470,7 +488,6 @@ def python_extract_summary_text_fallback(photo_gallery_items):
                     "actual_date": act
                 })
                 
-                # 回填日期到 header_info (只要抓到一筆有的就更新)
                 if sched and not header_info.get("scheduled_date"): header_info["scheduled_date"] = sched
                 if act and not header_info.get("actual_date"): header_info["actual_date"] = act
                 
