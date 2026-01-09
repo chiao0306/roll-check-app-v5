@@ -2101,7 +2101,9 @@ if st.session_state.photo_gallery:
         with st.status("總稽核官正在進行全方位分析...", expanded=True) as status_box:
             progress_bar = st.progress(0)
             
-            # 1. OCR
+            # ==========================================
+            # 1. OCR 文字識別
+            # ==========================================
             status_box.write("👀 正在進行 OCR 文字識別...")
             ocr_start = time.time()
             
@@ -2109,7 +2111,6 @@ if st.session_state.photo_gallery:
                 if item.get('full_text'): return index, item.get('header_text',''), item['full_text'], None, None 
                 try:
                     item['file'].seek(0)
-                    # 🔥 修改：把 result 接住 (變數 r)
                     r, h, f, _, _ = extract_layout_with_azure(item['file'], DOC_ENDPOINT, DOC_KEY)
                     return index, h, f, r, None 
                 except Exception as e: return index, None, None, None, str(e)
@@ -2130,12 +2131,11 @@ if st.session_state.photo_gallery:
             ocr_duration = time.time() - ocr_start
 
             # ==========================================
-            # ✂️ 2. 執行切割手術 (The Surgery) - 新增區塊
+            # ✂️ 2. 執行切割手術 (The Surgery)
             # ==========================================
-            # 定義手術刀函式 (依據關鍵字切割總表與明細)
+            # 定義手術刀函式
             def cut_text_for_processing(full_text):
                 if not full_text: return "", ""
-                # 關鍵字：根據您的圖片，分隔線通常在這些字附近
                 markers = ["規格標準", "檢驗紀錄", "編號", "尺寸"]
                 split_idx = -1
                 for m in markers:
@@ -2144,18 +2144,14 @@ if st.session_state.photo_gallery:
                         if split_idx == -1 or idx < split_idx: split_idx = idx
                 
                 if split_idx != -1:
-                    return full_text[:split_idx], full_text[split_idx:] # (上半部, 下半部)
+                    return full_text[:split_idx], full_text[split_idx:]
                 else:
-                    return full_text, full_text # 切割失敗，就假設整頁給 AI (安全起見)
+                    return full_text, full_text
 
-            # 對每一頁進行切割，並存回 photo_gallery
+            # 對每一頁進行切割
             for p in st.session_state.photo_gallery:
                 f_text = p.get('full_text', '')
                 top, bottom = cut_text_for_processing(f_text)
-                
-                # 存起來！
-                # 'summary_text' -> 給 Python B計畫 抓總表用 (上半部)
-                # 'detail_text'  -> 給 AI 抓明細用 (下半部)
                 p['summary_text'] = top
                 p['detail_text'] = bottom
 
@@ -2165,28 +2161,23 @@ if st.session_state.photo_gallery:
             status_box.write("🤖 AI 正在分批並行處理 (Turbo Mode)...")
             ai_start_time = time.time()
             
-            # 準備批次
             all_pages = st.session_state.photo_gallery
             batches = list(split_into_batches(all_pages, max_size=3)) 
             
             ai_futures = []
             results_bucket = [None] * len(batches) 
 
-            # 定義子任務 (🔥 關鍵修改：改用 detail_text)
             def process_batch(batch_idx, batch_pages):
                 batch_text = ""
                 for p in batch_pages:
                     real_idx = all_pages.index(p) + 1 
-                    # 🔥 這裡只餵下半部給 AI (detail_text)
+                    # 🔥 只餵 detail_text
                     txt_content = p.get('detail_text', '') 
                     batch_text += f"\n=== Page {real_idx} (Detail Zone) ===\n{txt_content}\n"
                 
-                # 全卷搜索文字也只給下半部，避免 AI 偷看總表
                 full_text_all = "".join([p.get('detail_text', '') for p in all_pages])
-                
                 return agent_unified_check(batch_text, full_text_all, GEMINI_KEY, main_model_name)
 
-            # 同時發射火箭
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 for idx, batch in enumerate(batches):
                     future = executor.submit(process_batch, idx, batch)
@@ -2200,19 +2191,19 @@ if st.session_state.photo_gallery:
                         results_bucket[idx] = {"header_info": {}, "summary_rows": [], "dimension_data": [], "issues": []}
                         st.error(f"Batch {idx+1} 分析失敗: {e}")
 
-            # 3. 拼湊結果
+            # 拼湊 AI 結果
             res_main = merge_ai_results(results_bucket)
             
-            # 為了讓 Cache 存到完整的文字 (給 Excel 規則比對用)，我們還是組一個全卷字串
+            # 為了 Cache 用，還是存一份完整文字
             combined_input = ""
             for i, p in enumerate(all_pages):
                 combined_input += f"\n=== Page {i+1} ===\n{p.get('full_text','')}\n"
             
             ai_duration = time.time() - ai_start_time
             
-                        # -----------------------------------------------------------
-            # ✂️ [新增功能] 移花接木手術 (V10: 手術刀分流版)
-            # -----------------------------------------------------------
+            # ==========================================
+            # ✂️ [移花接木手術] V10: 手術刀分流版
+            # ==========================================
             try:
                 if st.session_state.photo_gallery:
                     py_header = {}
@@ -2220,85 +2211,85 @@ if st.session_state.photo_gallery:
                     source_method = "無"
                     first_page_item = st.session_state.photo_gallery[0]
 
-                    # A 模式: Azure Map (最優先，因為座標最準)
+                    # A 模式: Azure Map (優先)
                     if first_page_item.get('azure_result'):
                         py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
                         source_method = "Azure Map (精準座標)"
                     
                     # B 計畫: Regex + 手術刀 (只看上半部)
                     elif first_page_item.get('full_text'):
-                        # 🔥 關鍵修改：先切割，只拿上半部給 Python 看！
-                        # 我們只看第一頁的上半部就好 (通常總表只在第一頁)
-                        # 如果您的總表會跨頁，那就對每一頁都切
-                        
+                        # 先切割，建立只包含上半部的臨時列表
                         top_only_pages = []
                         for p in st.session_state.photo_gallery:
-                            t_text, _ = cut_text_for_processing(p.get('full_text', ''))
+                            # 這裡直接拿剛剛切好的 summary_text
+                            t_text = p.get('summary_text', '') 
+                            # 如果沒切好，再切一次
+                            if not t_text: 
+                                t_text, _ = cut_text_for_processing(p.get('full_text', ''))
                             top_only_pages.append({'full_text': t_text})
                         
-                        # 呼叫 V9 引擎，但餵的是乾淨的上半部
+                        # 呼叫 V9 引擎
                         py_header, py_summary = python_extract_summary_text_fallback(top_only_pages)
                         source_method = "Full Text Regex (僅掃描上半部)"
                     
+                    # 🔥 [補上遺失的邏輯] 開始覆蓋！
+                    if py_summary or py_header.get("job_no"):
+                        print(f"✅ [移花接木啟動] 來源模式: {source_method}")
+                        if py_header.get("job_no"):
+                            if "header_info" not in res_main: res_main["header_info"] = {}
+                            res_main["header_info"]["job_no"] = py_header["job_no"]
+                        
+                        if py_header.get("scheduled_date"):
+                            if "header_info" not in res_main: res_main["header_info"] = {}
+                            res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
+                            res_main["header_info"]["actual_date"] = py_header["actual_date"]
+
+                        if py_summary:
+                            res_main["summary_rows"] = py_summary
+                            print(f"   -> 已覆蓋總表，共 {len(py_summary)} 筆數據")
+
+            except Exception as e:
+                print(f"❌ [移花接木失敗] 錯誤原因: {e}")
+
             # ========================================================
-            # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
+            # 🔥 資料修復流水線 (結構修復 -> 語意修復)
             # ========================================================
             raw_dim_data = res_main.get("dimension_data", [])
-            
-            # 步驟 1: 執行羅賓漢 (修復結構)
-            # 先解決視覺斷行誤判 (例如 7個變12個的問題)
             balanced_dim_data = rebalance_orphan_data(raw_dim_data)
-            
-            # 步驟 2: 執行強制更名 (修復語意/筆誤)
-            # 讀取 Excel Force_Rename，把 "軸頸再生" 強制改名為 "軸頸銲補"
-            # 傳入的是已經結構正確的 balanced_dim_data
             final_dim_data = apply_forced_renaming(balanced_dim_data)
-            
-            # 步驟 3: 回存最終結果 (確保後續所有流程都用新名字)
             res_main["dimension_data"] = final_dim_data
-            # ========================================================
 
-            # 4. Python 邏輯檢查 (加入計時)
+            # 4. Python 邏輯檢查
             status_box.write("🐍 Python 正在進行邏輯比對...")
+            py_start_time = time.time()
             
-            py_start_time = time.time() # ⏱️ [計時開始] Python
-            
-            # 這裡直接取用剛剛修復並改名後的 final_dim_data (從 res_main 拿)
             dim_data = res_main.get("dimension_data", [])
-            
-            # 重新跑分類 (重要！因為名字剛被我們改成銲補，這裡分類就會自動變成銲補)
             for item in dim_data:
                 new_cat = assign_category_by_python(item.get("item_title", ""))
                 item["category"] = new_cat
                 if "sl" not in item: item["sl"] = {}
                 item["sl"]["lt"] = new_cat
             
-            # 開始各項稽核 (傳入修復後的資料)
             python_numeric_issues = python_numerical_audit(dim_data)
             python_accounting_issues = python_accounting_audit(dim_data, res_main)
             python_process_issues = python_process_audit(dim_data)
             python_header_issues = python_header_audit_batch(st.session_state.photo_gallery, res_main)
 
-            # 🔥 [關鍵補救] 這一塊必須留著！不能全刪！
             ai_filtered_issues = []
             ai_raw_issues = res_main.get("issues", [])
             if isinstance(ai_raw_issues, list):
                 for i in ai_raw_issues:
                     if isinstance(i, dict):
                         i['source'] = '🤖 總稽核 AI'
-                        # 過濾掉一些沒用的 AI 雜訊
                         if not any(k in i.get("issue_type", "") for k in ["流程", "規格提取失敗", "未匹配"]):
                             ai_filtered_issues.append(i)
 
-            # 🔥 這裡執行合併 (現在 ai_filtered_issues 已經復活了，不會再報錯)
             all_issues = ai_filtered_issues + python_numeric_issues + python_accounting_issues + python_process_issues + python_header_issues
             
-            py_duration = time.time() - py_start_time # ⏱️ [計時結束] Python
+            py_duration = time.time() - py_start_time
 
             # 5. 存檔 (Cache)
             usage = res_main.get("_token_usage", {"input": 0, "output": 0})
-            
-            # 修正工令讀取邏輯
             final_job_no = res_main.get("header_info", {}).get("job_no")
             if not final_job_no or final_job_no == "Unknown":
                  final_job_no = res_main.get("job_no", "Unknown")
@@ -2309,13 +2300,11 @@ if st.session_state.photo_gallery:
                 "all_issues": all_issues,
                 "total_duration": time.time() - total_start,
                 "ocr_duration": ocr_duration,
-                "ai_duration": ai_duration,     # AI 耗時
-                "py_duration": py_duration,     # Python 耗時
-                
+                "ai_duration": ai_duration,
+                "py_duration": py_duration,
                 "cost_twd": (usage.get("input", 0)*0.3 + usage.get("output", 0)*2.5) / 1000000 * 32.5,
                 "total_in": usage.get("input", 0),
                 "total_out": usage.get("output", 0),
-                
                 "ai_extracted_data": dim_data,
                 "freight_target": res_main.get("freight_target", 0),
                 "summary_rows": res_main.get("summary_rows", []),
