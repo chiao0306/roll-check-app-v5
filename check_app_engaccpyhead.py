@@ -385,78 +385,97 @@ def python_extract_summary_strict(azure_result):
 
     return header_info, summary_rows
     
-def python_extract_summary_text_fallback(full_text):
+def python_extract_summary_text_fallback(photo_gallery_items):
     """
-    Python 總表提取 (B計畫 - 雙模升級版)：Regex
-    用途：
-    1. 支援「OCR 純文字」 (舊 JSON / 圖片文字)。
-    2. 支援「Excel Markdown」 (有 | 符號分隔的表格)。
+    Python 總表提取 (B計畫 - V5 終極版)：
+    1. 支援「多頁」總表 (遍歷所有頁面)。
+    2. 支援「空值」數量 (實交數量沒填也能抓)。
+    3. 支援「含空格」日期 (113 . 01 . 01 也能抓)。
     """
     import re
     header_info = {}
     summary_rows = []
     
-    if not full_text: return header_info, summary_rows
+    if not photo_gallery_items: return header_info, summary_rows
 
-    # 1. 抓工令 (W/R/O/Y 開頭)
-    # 不管是純文字還是表格內的工令，通常格式都是 "工令編號:W..."，這行不用改
-    job_match = re.search(r"工令編號[:：\s\|]*([WROY]\w+)", full_text, re.IGNORECASE)
-    if job_match: header_info["job_no"] = job_match.group(1).strip()
+    # 1. 抓工令 (通常在第一頁，但我們還是掃描一下前幾頁比較保險)
+    # 我們只看前 2 頁來找工令，避免誤判
+    for i in range(min(2, len(photo_gallery_items))):
+        full_text = photo_gallery_items[i].get('full_text', '')
+        job_match = re.search(r"工令編號[:：\s\|]*([WROY]\w+)", full_text, re.IGNORECASE)
+        if job_match: 
+            header_info["job_no"] = job_match.group(1).strip()
+            break # 抓到就停
 
-    # 2. 抓每一行總表數據 (升級 Regex)
-    # 兼容格式 A (OCR): "1  W3名稱  PC  13  13"
-    # 兼容格式 B (Excel): "| 1 | W3名稱 | PC | 13 | 13 |"
-    
+    # 2. 抓總表數據 (遍歷每一頁)
     # 定義單位白名單
     units = r"(PC|SET|EA|UNIT|KG|M|組|件|式|台|顆)"
     
-    # 🚀 升級後的 Regex：在每個欄位之間加入 `\s*\|?\s*` (允許空白或直槓)
-    # Group 1: 項次
-    # Group 2: 名稱
-    # Group 3: 單位
-    # Group 4: 申請數量
-    # Group 5: 實交數量
+    # 🚀 升級 Regex：
+    # - 數量欄位改用 [\d\s]* (允許數字或空白)，避免因為空值而抓到後面的字
+    # - 日期部分改為 tail 解析
     pattern = re.compile(
-        rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # 行首 + 可選直槓 + 項次(數字) + 分隔
-        rf"(.+?)\s*\|?\s*"                # 名稱 + 分隔
-        rf"{units}\s*\|?\s*"              # 單位 + 分隔
-        rf"(\d+)\s*\|?\s*"                # 申請數量 + 分隔
-        rf"(\d+)"                         # 實交數量
-        rf"(.*)",                         # 後面剩下的 (日期等)
+        rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # Group 1: 項次 (數字)
+        rf"(.+?)\s*\|?\s*"                # Group 2: 名稱
+        rf"{units}\s*\|?\s*"              # Group 3: 單位
+        rf"([\d\s]*)\s*\|?\s*"            # Group 4: 申請數量 (允許空)
+        rf"([\d\s]*)"                     # Group 5: 實交數量 (允許空)
+        rf"(.*)",                         # Group 6: 尾巴 (找日期)
         re.MULTILINE
     )
-    
-    matches = pattern.findall(full_text)
-    
-    for m in matches:
-        try:
-            idx = int(m[0])
-            name = m[1].strip().replace("|", "") # 保險起見，把名稱裡可能殘留的 | 去掉
-            # 單位 m[2]
-            q_apply = int(m[3])
-            q_deliver = int(m[4])
-            tail = m[5]
-            
-            # 抓日期 (格式 113.01.20 或 2024/01/20)
-            dates = re.findall(r"(\d{2,4}[./]\d{1,2}[./]\d{1,2})", tail)
-            sched = dates[0] if len(dates) > 0 else ""
-            act = dates[1] if len(dates) > 1 else ""
-            
-            summary_rows.append({
-                "page": 1,
-                "index": idx,
-                "title": name,
-                "apply_qty": q_apply,
-                "delivery_qty": q_deliver,
-                "sched_date": sched,
-                "actual_date": act
-            })
-            
-            # 回填日期到表頭
-            if sched: header_info["scheduled_date"] = sched
-            if act: header_info["actual_date"] = act
-            
-        except: continue
+
+    for page_idx, item in enumerate(photo_gallery_items):
+        full_text = item.get('full_text', '')
+        if not full_text: continue
+        
+        matches = pattern.findall(full_text)
+        
+        for m in matches:
+            try:
+                # 1. 基礎欄位清洗
+                idx_str = m[0].strip()
+                name = m[1].strip().replace("|", "")
+                unit = m[2].strip()
+                
+                # [過濾] 如果名稱本身就是純數字 (例如 "0")，通常是 OCR 錯位或頁碼雜訊 -> 跳過
+                if name.isdigit() or len(name) < 2: 
+                    continue
+
+                # 2. 數量清洗 (處理空格)
+                q_apply_str = re.sub(r"\D", "", m[3]) # 只留數字
+                q_deliver_str = re.sub(r"\D", "", m[4])
+                
+                q_apply = int(q_apply_str) if q_apply_str else 0
+                q_deliver = int(q_deliver_str) if q_deliver_str else 0
+                
+                # 3. 日期清洗 (升級版 Regex，允許空格)
+                tail = m[5]
+                # 抓取像是 113.01.20, 113 . 1 . 20, 2024/01/20
+                dates = re.findall(r"(\d{2,4}\s*[./]\s*\d{1,2}\s*[./]\s*\d{1,2})", tail)
+                
+                # 移除日期字串裡的空格，標準化格式
+                clean_dates = [d.replace(" ", "") for d in dates]
+                
+                sched = clean_dates[0] if len(clean_dates) > 0 else ""
+                act = clean_dates[1] if len(clean_dates) > 1 else ""
+                
+                # 4. 存入結果
+                summary_rows.append({
+                    "page": page_idx + 1, # 真實頁碼
+                    "index": int(idx_str),
+                    "title": name,
+                    "apply_qty": q_apply,
+                    "delivery_qty": q_deliver,
+                    "sched_date": sched,
+                    "actual_date": act
+                })
+                
+                # 回填日期到 header_info (只要抓到一筆有的就更新)
+                if sched and not header_info.get("scheduled_date"): header_info["scheduled_date"] = sched
+                if act and not header_info.get("actual_date"): header_info["actual_date"] = act
+                
+            except Exception: 
+                continue
 
     return header_info, summary_rows
     
@@ -2118,29 +2137,30 @@ if st.session_state.photo_gallery:
             
             ai_duration = time.time() - ai_start_time
             
-                        # -----------------------------------------------------------
-            # ✂️ [新增功能] 移花接木手術 (V4: 支援舊 JSON 回測版)
+            # -----------------------------------------------------------
+            # ✂️ [新增功能] 移花接木手術 (V5: 終極雙模版)
             # -----------------------------------------------------------
             try:
                 if st.session_state.photo_gallery:
-                    first_page_item = st.session_state.photo_gallery[0]
-                    
                     # 準備變數
                     py_header = {}
                     py_summary = []
                     source_method = "無"
+                    first_page_item = st.session_state.photo_gallery[0]
 
-                    # 情況 A: 有 Azure 原始地圖 (新照片模式)
+                    # 情況 A: 有 Azure 原始地圖 (新照片模式 - 精準度最高)
+                    # 邏輯：如果有 Azure 原始物件，優先使用座標提取
                     if first_page_item.get('azure_result'):
                         py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
-                        source_method = "Azure Map (精準)"
+                        source_method = "Azure Map (精準座標)"
                     
-                    # 情況 B: 只有文字 (舊 JSON 模式) -> 啟動 B 計畫
+                    # 情況 B: 只有文字 (舊 JSON / Excel / Azure 備援) -> 啟動 B 計畫 V5
+                    # 邏輯：如果沒地圖但有文字，呼叫新版函式傳入「整本相簿」進行全卷掃描
                     elif first_page_item.get('full_text'):
-                        py_header, py_summary = python_extract_summary_text_fallback(first_page_item['full_text'])
-                        source_method = "Full Text Regex (備用)"
+                        py_header, py_summary = python_extract_summary_text_fallback(st.session_state.photo_gallery)
+                        source_method = "Full Text Regex V5 (全卷掃描)"
                     
-                    # 開始覆蓋 (如果有抓到東西的話)
+                    # 開始覆蓋 (只要有抓到任何東西就啟動)
                     if py_summary or py_header.get("job_no"):
                         print(f"✅ [移花接木啟動] 來源模式: {source_method}")
                         
@@ -2151,19 +2171,21 @@ if st.session_state.photo_gallery:
                         
                         # 2. 覆蓋日期
                         if py_header.get("scheduled_date"):
+                            if "header_info" not in res_main: res_main["header_info"] = {}
                             res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
                             res_main["header_info"]["actual_date"] = py_header["actual_date"]
 
-                        # 3. 覆蓋總表 (只有當 B 計畫真的抓到東西時才覆蓋，避免空白蓋掉 AI)
+                        # 3. 覆蓋總表
                         if py_summary:
                             res_main["summary_rows"] = py_summary
-                            print(f"   -> 已覆蓋總表，共 {len(py_summary)} 筆")
+                            print(f"   -> 已覆蓋總表，共 {len(py_summary)} 筆數據")
                     else:
-                        print("⚠️ [移花接木落空] Python 沒抓到總表數據，維持 AI 結果")
+                        print(f"⚠️ [移花接木落空] {source_method} 沒抓到總表數據，維持 AI 結果")
 
             except Exception as e:
                 print(f"❌ [移花接木失敗] 錯誤原因: {e}")
             # -----------------------------------------------------------
+
             
             # ========================================================
             # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
