@@ -325,7 +325,7 @@ def python_extract_summary_strict(azure_result):
     for table in azure_result.tables:
         # 把這個表格的所有內容拼起來檢查有沒有關鍵字
         table_content = "".join([cell.content for cell in table.cells])
-        if "申請數量" in table_content and "實交數量" in table_content:
+        if "數量" in table_content and "數量" in table_content:
             target_table = table
             break
             
@@ -382,6 +382,71 @@ def python_extract_summary_strict(azure_result):
             # 順便抓一下日期填回 Header Info (通常每一行日期都一樣，抓最後一行的就好)
             if item["sched_date"]: header_info["scheduled_date"] = item["sched_date"]
             if item["actual_date"]: header_info["actual_date"] = item["actual_date"]
+
+    return header_info, summary_rows
+    
+def python_extract_summary_text_fallback(full_text):
+    """
+    Python 總表提取 (B計畫)：純文字 Regex 版
+    用途：當沒有 Azure 原始物件 (如讀取舊 JSON) 時，嘗試從文字中硬抓。
+    """
+    import re
+    header_info = {}
+    summary_rows = []
+    
+    if not full_text: return header_info, summary_rows
+
+    # 1. 抓工令 (W/R/O/Y 開頭)
+    job_match = re.search(r"工令編號[:：\s]*([WROY]\w+)", full_text, re.IGNORECASE)
+    if job_match: header_info["job_no"] = job_match.group(1).strip()
+
+    # 2. 抓每一行總表數據
+    # 邏輯：找行首是數字 -> 中間是文字 -> 單位(PC/SET...) -> 數字(申請) -> 數字(實交)
+    # 例如： "1 W3 #1機ROLL銲補 PC 13 13 ..."
+    
+    # 定義單位白名單 (可自行擴充)
+    units = r"(PC|SET|EA|UNIT|KG|M|組|件|式|台|顆)"
+    
+    # Regex 解析模式
+    # Group 1: 項次 (數字)
+    # Group 2: 名稱 (非貪婪匹配)
+    # Group 3: 單位
+    # Group 4: 申請數量
+    # Group 5: 實交數量
+    # Group 6: 後面剩下的 (日期等)
+    pattern = re.compile(rf"^\s*(\d+)\s+(.+?)\s+{units}\s+(\d+)\s+(\d+)(.*)", re.MULTILINE)
+    
+    matches = pattern.findall(full_text)
+    
+    for m in matches:
+        try:
+            idx = int(m[0])
+            name = m[1].strip()
+            # 單位 m[2]
+            q_apply = int(m[3])
+            q_deliver = int(m[4])
+            tail = m[5]
+            
+            # 嘗試從尾巴抓日期 (格式 113.01.20 或 2024/01/20)
+            dates = re.findall(r"(\d{2,4}[./]\d{1,2}[./]\d{1,2})", tail)
+            sched = dates[0] if len(dates) > 0 else ""
+            act = dates[1] if len(dates) > 1 else ""
+            
+            summary_rows.append({
+                "page": 1,
+                "index": idx,
+                "title": name,
+                "apply_qty": q_apply,
+                "delivery_qty": q_deliver,
+                "sched_date": sched,
+                "actual_date": act
+            })
+            
+            # 回填日期到表頭
+            if sched: header_info["scheduled_date"] = sched
+            if act: header_info["actual_date"] = act
+            
+        except: continue
 
     return header_info, summary_rows
     
@@ -2043,36 +2108,49 @@ if st.session_state.photo_gallery:
             
             ai_duration = time.time() - ai_start_time
             
-            # -----------------------------------------------------------
-            # ✂️ [新增功能] 移花接木手術：用 Python 強制覆蓋總表數據 (實戰版)
+                        # -----------------------------------------------------------
+            # ✂️ [新增功能] 移花接木手術 (V4: 支援舊 JSON 回測版)
             # -----------------------------------------------------------
             try:
-                # 1. 檢查是否有第一頁的 Azure 原始「地圖」(azure_result)
                 if st.session_state.photo_gallery:
-                    first_page_data = st.session_state.photo_gallery[0].get('azure_result')
+                    first_page_item = st.session_state.photo_gallery[0]
                     
-                    if first_page_data:
-                        # 2. 執行 Python 硬提取 (呼叫我們之前寫好的新工具)
-                        py_header, py_summary = python_extract_summary_strict(first_page_data)
+                    # 準備變數
+                    py_header = {}
+                    py_summary = []
+                    source_method = "無"
+
+                    # 情況 A: 有 Azure 原始地圖 (新照片模式)
+                    if first_page_item.get('azure_result'):
+                        py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
+                        source_method = "Azure Map (精準)"
+                    
+                    # 情況 B: 只有文字 (舊 JSON 模式) -> 啟動 B 計畫
+                    elif first_page_item.get('full_text'):
+                        py_header, py_summary = python_extract_summary_text_fallback(first_page_item['full_text'])
+                        source_method = "Full Text Regex (備用)"
+                    
+                    # 開始覆蓋 (如果有抓到東西的話)
+                    if py_summary or py_header.get("job_no"):
+                        print(f"✅ [移花接木啟動] 來源模式: {source_method}")
                         
-                        # 3. 如果 Python 抓到工令，強行覆蓋 AI 的結果
+                        # 1. 覆蓋工令
                         if py_header.get("job_no"):
-                            # 確保 header_info 容器存在
                             if "header_info" not in res_main: res_main["header_info"] = {}
                             res_main["header_info"]["job_no"] = py_header["job_no"]
                         
-                        # 4. 如果 Python 抓到日期，強行覆蓋 AI 的結果
+                        # 2. 覆蓋日期
                         if py_header.get("scheduled_date"):
                             res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
                             res_main["header_info"]["actual_date"] = py_header["actual_date"]
 
-                        # 5. 如果 Python 抓到總表表格，直接整張換掉
+                        # 3. 覆蓋總表 (只有當 B 計畫真的抓到東西時才覆蓋，避免空白蓋掉 AI)
                         if py_summary:
                             res_main["summary_rows"] = py_summary
-                            # 在後台印出成功訊息，方便除錯
-                            print(f"✅ [移花接木成功] 已使用 Python 硬提取覆蓋總表，共 {len(py_summary)} 筆數據")
+                            print(f"   -> 已覆蓋總表，共 {len(py_summary)} 筆")
                     else:
-                        print("⚠️ [移花接木跳過] 第一頁找不到 azure_result (地圖缺失)")
+                        print("⚠️ [移花接木落空] Python 沒抓到總表數據，維持 AI 結果")
+
             except Exception as e:
                 print(f"❌ [移花接木失敗] 錯誤原因: {e}")
             # -----------------------------------------------------------
