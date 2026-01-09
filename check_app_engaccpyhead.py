@@ -2131,29 +2131,42 @@ if st.session_state.photo_gallery:
             ocr_duration = time.time() - ocr_start
 
             # ==========================================
-            # ✂️ 2. 執行切割手術 (The Surgery)
+            # ✂️ 2. 執行切割手術 (V14: 表頭完整保留版)
             # ==========================================
-            # 定義手術刀函式
             def cut_text_for_processing(full_text):
                 if not full_text: return "", ""
-                markers = ["規格標準", "檢驗紀錄", "編號", "尺寸"]
-                split_idx = -1
-                for m in markers:
-                    idx = full_text.find(m)
-                    if idx != -1:
-                        if split_idx == -1 or idx < split_idx: split_idx = idx
                 
-                if split_idx != -1:
-                    return full_text[:split_idx], full_text[split_idx:]
+                # 1. 第一優先關鍵字
+                primary_marker = "規範標準"
+                
+                idx = full_text.find(primary_marker)
+                
+                # 2. 第二優先 (避開標題的檢驗紀錄)
+                if idx == -1:
+                    secondary_marker = "檢驗紀錄"
+                    # 跳過前 100 字，避免抓到大標題
+                    idx = full_text.find(secondary_marker, 100)
+                
+                # 3. 執行切割 (🔥 關鍵修正)
+                if idx != -1:
+                    # 找到了！但我們不要從「規」字開始切
+                    # 我們要往回找「這一行的開頭」(也就是上一個換行符號的位置)
+                    # rfind 是從右邊往左邊找
+                    line_start = full_text.rfind('\n', 0, idx)
+                    
+                    if line_start != -1:
+                        # 找到了換行符號，切割點設在換行符號之後 (包含該符號給上半部或下半部皆可，這裡給下半部讓版面乾淨)
+                        split_point = line_start
+                    else:
+                        # 萬一這一行是整頁的第一行 (沒換行)，就直接用 idx 往前推一點
+                        split_point = idx
+                    
+                    # 上半部 (Top): 包含總表
+                    # 下半部 (Bottom): 從表頭開始，包含完整明細
+                    return full_text[:split_point], full_text[split_point:] 
                 else:
+                    # 沒找到關鍵字，回傳全文備用
                     return full_text, full_text
-
-            # 對每一頁進行切割
-            for p in st.session_state.photo_gallery:
-                f_text = p.get('full_text', '')
-                top, bottom = cut_text_for_processing(f_text)
-                p['summary_text'] = top
-                p['detail_text'] = bottom
 
             # ==========================================
             # 🤖 3. AI 並行分析 (只餵 Detail Zone)
