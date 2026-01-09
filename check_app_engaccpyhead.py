@@ -2131,41 +2131,37 @@ if st.session_state.photo_gallery:
             ocr_duration = time.time() - ocr_start
 
             # ==========================================
-            # ✂️ 2. 執行切割手術 (V14: 表頭完整保留版)
+            # ✂️ 2. 執行切割手術 (V16: 精準倒車 20 字版)
             # ==========================================
             def cut_text_for_processing(full_text):
                 if not full_text: return "", ""
                 
-                # 1. 第一優先關鍵字
+                # 1. 鎖定明細表的核心關鍵字
                 primary_marker = "規範標準"
-                
                 idx = full_text.find(primary_marker)
                 
-                # 2. 第二優先 (避開標題的檢驗紀錄)
+                # 2. 備案：如果沒抓到規範標準，抓檢驗紀錄 (跳過標題區)
                 if idx == -1:
                     secondary_marker = "檢驗紀錄"
-                    # 跳過前 100 字，避免抓到大標題
                     idx = full_text.find(secondary_marker, 100)
                 
-                # 3. 執行切割 (🔥 關鍵修正)
                 if idx != -1:
-                    # 找到了！但我們不要從「規」字開始切
-                    # 我們要往回找「這一行的開頭」(也就是上一個換行符號的位置)
-                    # rfind 是從右邊往左邊找
-                    line_start = full_text.rfind('\n', 0, idx)
+                    # 找到了！依照您的觀察，往回退 20 個字剛剛好
+                    # 這樣能保證「規範標準」這行表頭被完整包進去
+                    safe_split = max(0, idx - 20)
                     
-                    if line_start != -1:
-                        # 找到了換行符號，切割點設在換行符號之後 (包含該符號給上半部或下半部皆可，這裡給下半部讓版面乾淨)
-                        split_point = line_start
-                    else:
-                        # 萬一這一行是整頁的第一行 (沒換行)，就直接用 idx 往前推一點
-                        split_point = idx
+                    # 上半部 (Top): 給 Python
+                    # 切割點設在 idx (關鍵字本身)，這樣總表內容會完整保留在 Top
+                    top_part = full_text[:idx]
                     
-                    # 上半部 (Top): 包含總表
-                    # 下半部 (Bottom): 從表頭開始，包含完整明細
-                    return full_text[:split_point], full_text[split_point:] 
+                    # 下半部 (Bottom): 給 AI
+                    # 起始點設在 safe_split (關鍵字前 20 字)，確保 AI 看到表頭結構
+                    bottom_part = full_text[safe_split:]
+                    
+                    # 這樣中間會有 20 個字的「重疊區」，確保交界處滴水不漏！
+                    return top_part, bottom_part
                 else:
-                    # 沒找到關鍵字，回傳全文備用
+                    # 沒找到關鍵字，雙方都給全文 (安全備案)
                     return full_text, full_text
 
             # ==========================================
@@ -2214,64 +2210,54 @@ if st.session_state.photo_gallery:
             
             ai_duration = time.time() - ai_start_time
             
+                        # ... (接在 ai_duration 之後) ...
+            
             # ==========================================
-            # ✂️ [移花接木手術] V11: 間諜監控版
+            # ✂️ [移花接木] V11: 雙面間諜監控版
             # ==========================================
             try:
                 if st.session_state.photo_gallery:
                     py_header = {}
                     py_summary = []
-                    source_method = "無"
                     first_page_item = st.session_state.photo_gallery[0]
+
+                    # 🕵️‍♂️ 監控報告：看一下我們切給 AI 的下半部長怎樣
+                    # 如果這裡印出來是空的，或是沒有表頭，那就是切割的問題
+                    ai_text_preview = first_page_item.get('detail_text', '')
+                    print(f"\n🔍 [AI 下半部預覽] (前 150 字):\n{ai_text_preview[:150].replace(chr(10), ' ')}...")
+                    print("-" * 30)
 
                     # A 模式: Azure Map
                     if first_page_item.get('azure_result'):
                         py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
-                        source_method = "Azure Map (精準座標)"
+                        source_method = "Azure Map"
                     
-                    # B 計畫: Regex (讀取切割後的上半部)
-                    elif first_page_item.get('full_text'):
+                    # B 計畫: Regex (讀取 summary_text)
+                    elif first_page_item.get('summary_text'): # 這裡用 summary_text
                         
-                        # 1. 準備上半部文字
                         top_only_pages = []
-                        for i, p in enumerate(st.session_state.photo_gallery):
+                        for p in st.session_state.photo_gallery:
                             t_text = p.get('summary_text', '')
-                            # 防呆：如果沒切好，就拿全文
-                            if not t_text: t_text = p.get('full_text', '')
+                            if not t_text: t_text = p.get('full_text', '') # 防呆
                             top_only_pages.append({'full_text': t_text})
-                            
-                            # 🕵️‍♂️ 間諜 Log：偷看第一頁被切成什麼樣子
-                            if i == 0:
-                                print(f"\n🔍 [切割檢查] 第一頁上半部文字長度: {len(t_text)}")
-                                print(f"🔍 [切割內容預覽] (前100字): {t_text[:100].replace(chr(10), ' ')}...")
                         
-                        # 2. 呼叫 V9 引擎
                         py_header, py_summary = python_extract_summary_text_fallback(top_only_pages)
-                        source_method = "Full Text Regex (僅掃描上半部)"
+                        source_method = "Full Text Regex (Top Only)"
                     
-                    # 覆蓋邏輯
+                    # 執行覆蓋
                     if py_summary or py_header.get("job_no"):
-                        print(f"✅ [移花接木啟動] 模式: {source_method}")
-                        
+                        print(f"✅ [移花接木成功] 模式: {source_method}")
                         if py_header.get("job_no"):
                             if "header_info" not in res_main: res_main["header_info"] = {}
                             res_main["header_info"]["job_no"] = py_header["job_no"]
-                            print(f"   -> 工令: {py_header['job_no']}")
-
                         if py_header.get("scheduled_date"):
-                            if "header_info" not in res_main: res_main["header_info"] = {}
-                            res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
-                            res_main["header_info"]["actual_date"] = py_header["actual_date"]
-                            print(f"   -> 日期: {py_header['scheduled_date']} / {py_header['actual_date']}")
-
+                             if "header_info" not in res_main: res_main["header_info"] = {}
+                             res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
+                             res_main["header_info"]["actual_date"] = py_header["actual_date"]
                         if py_summary:
                             res_main["summary_rows"] = py_summary
-                            print(f"   -> 總表: 覆蓋 {len(py_summary)} 筆數據")
-                    else:
-                        print(f"⚠️ [移花接木落空] Python 沒抓到東西 (請檢查切割內容預覽)")
-
             except Exception as e:
-                print(f"❌ [移花接木失敗] 錯誤原因: {e}")
+                print(f"❌ [移花接木失敗]: {e}")
 
             # ========================================================
             # 🔥 資料修復流水線 (結構修復 -> 語意修復)
