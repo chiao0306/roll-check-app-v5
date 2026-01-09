@@ -2130,40 +2130,42 @@ if st.session_state.photo_gallery:
 
             ocr_duration = time.time() - ocr_start
 
-            # ==========================================
-            # ✂️ 2. 執行切割手術 (V16: 精準倒車 20 字版)
+                        # ==========================================
+            # ✂️ 2. 執行切割手術 (V17: 安全重疊版)
             # ==========================================
             def cut_text_for_processing(full_text):
                 if not full_text: return "", ""
                 
-                # 1. 鎖定明細表的核心關鍵字
-                primary_marker = "規範標準"
-                idx = full_text.find(primary_marker)
-                
-                # 2. 備案：如果沒抓到規範標準，抓檢驗紀錄 (跳過標題區)
-                if idx == -1:
-                    secondary_marker = "檢驗紀錄"
-                    idx = full_text.find(secondary_marker, 100)
+                # 1. 唯一真神：只鎖定這個絕對關鍵字
+                # 既然您確認這是整份文件唯一的分水嶺，我們就只信它
+                marker = "規範標準"
+                idx = full_text.find(marker)
                 
                 if idx != -1:
-                    # 找到了！依照您的觀察，往回退 20 個字剛剛好
-                    # 這樣能保證「規範標準」這行表頭被完整包進去
-                    safe_split = max(0, idx - 20)
+                    # 找到了！執行「安全重疊切割」
                     
                     # 上半部 (Top): 給 Python
-                    # 切割點設在 idx (關鍵字本身)，這樣總表內容會完整保留在 Top
-                    top_part = full_text[:idx]
+                    # 策略：切到關鍵字之後 50 字
+                    # 這樣 Python 就能完整看到 "總表... | 規範標準..." 這一行
+                    # 確保 Regex 知道總表在哪裡結束
+                    split_for_top = min(len(full_text), idx + 50)
+                    top_part = full_text[:split_for_top]
                     
                     # 下半部 (Bottom): 給 AI
-                    # 起始點設在 safe_split (關鍵字前 20 字)，確保 AI 看到表頭結構
-                    bottom_part = full_text[safe_split:]
+                    # 策略：從關鍵字往前退 50 字
+                    # 這樣 AI 就能完整看到 "...交貨數量 | 規範標準..." 這一行
+                    # 確保 AI 認得出這是表格的頭
+                    split_for_bottom = max(0, idx - 50)
+                    bottom_part = full_text[split_for_bottom:]
                     
-                    # 這樣中間會有 20 個字的「重疊區」，確保交界處滴水不漏！
                     return top_part, bottom_part
                 else:
-                    # 沒找到關鍵字，雙方都給全文 (安全備案)
+                    # ⚠️ 危險：沒找到關鍵字
+                    # 這時候千萬不能回傳空值，回傳全文當作保底
+                    # 這樣至少 B 計畫 V9 還能全卷掃描，不會「全部消失」
+                    print(f"⚠️ [切割警告] 找不到關鍵字 '{marker}'，使用全文模式")
                     return full_text, full_text
-
+                    
             # ==========================================
             # 🤖 3. AI 並行分析 (只餵 Detail Zone)
             # ==========================================
@@ -2210,10 +2212,8 @@ if st.session_state.photo_gallery:
             
             ai_duration = time.time() - ai_start_time
             
-                        # ... (接在 ai_duration 之後) ...
-            
             # ==========================================
-            # ✂️ [移花接木] V11: 雙面間諜監控版
+            # ✂️ [移花接木手術] V11: 監控修復版
             # ==========================================
             try:
                 if st.session_state.photo_gallery:
@@ -2221,25 +2221,26 @@ if st.session_state.photo_gallery:
                     py_summary = []
                     first_page_item = st.session_state.photo_gallery[0]
 
-                    # 🕵️‍♂️ 監控報告：看一下我們切給 AI 的下半部長怎樣
-                    # 如果這裡印出來是空的，或是沒有表頭，那就是切割的問題
-                    ai_text_preview = first_page_item.get('detail_text', '')
-                    print(f"\n🔍 [AI 下半部預覽] (前 150 字):\n{ai_text_preview[:150].replace(chr(10), ' ')}...")
-                    print("-" * 30)
+                    # 🕵️‍♂️ 切割點檢查 (請看 Terminal)
+                    t_text = first_page_item.get('summary_text', '')
+                    if t_text:
+                        print(f"\n🔍 [Python 上半部結尾] ...{t_text[-50:].replace(chr(10), ' ')}")
+                    else:
+                        print("\n⚠️ [Python 上半部] 是空的！(可能沒切到)")
 
                     # A 模式: Azure Map
                     if first_page_item.get('azure_result'):
                         py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
                         source_method = "Azure Map"
                     
-                    # B 計畫: Regex (讀取 summary_text)
-                    elif first_page_item.get('summary_text'): # 這裡用 summary_text
+                    # B 計畫: Regex (優先讀取 summary_text)
+                    elif first_page_item.get('summary_text') or first_page_item.get('full_text'):
                         
                         top_only_pages = []
                         for p in st.session_state.photo_gallery:
-                            t_text = p.get('summary_text', '')
-                            if not t_text: t_text = p.get('full_text', '') # 防呆
-                            top_only_pages.append({'full_text': t_text})
+                            # 優先拿切割好的上半部，沒有就拿全文
+                            txt = p.get('summary_text') if p.get('summary_text') else p.get('full_text', '')
+                            top_only_pages.append({'full_text': txt})
                         
                         py_header, py_summary = python_extract_summary_text_fallback(top_only_pages)
                         source_method = "Full Text Regex (Top Only)"
@@ -2256,8 +2257,12 @@ if st.session_state.photo_gallery:
                              res_main["header_info"]["actual_date"] = py_header["actual_date"]
                         if py_summary:
                             res_main["summary_rows"] = py_summary
+                            print(f"   -> 總表數據已覆蓋: {len(py_summary)} 筆")
+                    else:
+                        print("❌ [移花接木失敗] Python 還是沒抓到東西，請檢查 Log")
+
             except Exception as e:
-                print(f"❌ [移花接木失敗]: {e}")
+                print(f"❌ [移花接木錯誤]: {e}")
 
             # ========================================================
             # 🔥 資料修復流水線 (結構修復 -> 語意修復)
