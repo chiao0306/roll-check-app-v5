@@ -104,23 +104,38 @@ with st.sidebar:
         on_change=update_url_param
     )
 
-# --- [新增] Azure 物件替身 (用於讀取 JSON 時偽裝) ---
+# --- [修正] Azure 物件替身 (自動組裝 Rows 版) ---
 class MockCell:
     def __init__(self, data):
         self.content = data.get('content', '')
         self.column_index = data.get('columnIndex', 0)
+        self.row_index = data.get('rowIndex', 0) # 補上 rowIndex
 
 class MockRow:
-    def __init__(self, data):
-        self.cells = [MockCell(c) for c in data.get('cells', [])]
+    def __init__(self, cells_list):
+        # 這裡接收的已經是篩選過、屬於這一列的 cells 列表
+        self.cells = [MockCell(c) for c in cells_list]
 
 class MockTable:
     def __init__(self, data):
-        self.rows = [MockRow(r) for r in data.get('rows', [])]
+        # 1. 取得所有散落的 cells
+        all_cells = data.get('cells', [])
+        
+        # 2. 依照 rowIndex 進行分組 (Group by)
+        rows_map = {}
+        for c in all_cells:
+            r_idx = c.get('rowIndex', 0)
+            if r_idx not in rows_map: rows_map[r_idx] = []
+            rows_map[r_idx].append(c)
+            
+        # 3. 將分組後的資料轉為 MockRow 物件列表 (按順序)
+        self.rows = []
+        for r_idx in sorted(rows_map.keys()):
+            self.rows.append(MockRow(rows_map[r_idx]))
 
 class MockAnalyzeResult:
     def __init__(self, data):
-        # 兼容兩種 JSON 結構 (直接是 tables 或包在 analyzeResult 裡)
+        # 兼容兩種 JSON 結構
         tables_data = []
         if 'tables' in data:
             tables_data = data['tables']
