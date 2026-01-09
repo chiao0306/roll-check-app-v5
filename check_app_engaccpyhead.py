@@ -2202,7 +2202,7 @@ if st.session_state.photo_gallery:
             ai_duration = time.time() - ai_start_time
             
             # ==========================================
-            # ✂️ [移花接木手術] V10: 手術刀分流版
+            # ✂️ [移花接木手術] V11: 間諜監控版
             # ==========================================
             try:
                 if st.session_state.photo_gallery:
@@ -2211,42 +2211,51 @@ if st.session_state.photo_gallery:
                     source_method = "無"
                     first_page_item = st.session_state.photo_gallery[0]
 
-                    # A 模式: Azure Map (優先)
+                    # A 模式: Azure Map
                     if first_page_item.get('azure_result'):
                         py_header, py_summary = python_extract_summary_strict(first_page_item['azure_result'])
                         source_method = "Azure Map (精準座標)"
                     
-                    # B 計畫: Regex + 手術刀 (只看上半部)
+                    # B 計畫: Regex (讀取切割後的上半部)
                     elif first_page_item.get('full_text'):
-                        # 先切割，建立只包含上半部的臨時列表
-                        top_only_pages = []
-                        for p in st.session_state.photo_gallery:
-                            # 這裡直接拿剛剛切好的 summary_text
-                            t_text = p.get('summary_text', '') 
-                            # 如果沒切好，再切一次
-                            if not t_text: 
-                                t_text, _ = cut_text_for_processing(p.get('full_text', ''))
-                            top_only_pages.append({'full_text': t_text})
                         
-                        # 呼叫 V9 引擎
+                        # 1. 準備上半部文字
+                        top_only_pages = []
+                        for i, p in enumerate(st.session_state.photo_gallery):
+                            t_text = p.get('summary_text', '')
+                            # 防呆：如果沒切好，就拿全文
+                            if not t_text: t_text = p.get('full_text', '')
+                            top_only_pages.append({'full_text': t_text})
+                            
+                            # 🕵️‍♂️ 間諜 Log：偷看第一頁被切成什麼樣子
+                            if i == 0:
+                                print(f"\n🔍 [切割檢查] 第一頁上半部文字長度: {len(t_text)}")
+                                print(f"🔍 [切割內容預覽] (前100字): {t_text[:100].replace(chr(10), ' ')}...")
+                        
+                        # 2. 呼叫 V9 引擎
                         py_header, py_summary = python_extract_summary_text_fallback(top_only_pages)
                         source_method = "Full Text Regex (僅掃描上半部)"
                     
-                    # 🔥 [補上遺失的邏輯] 開始覆蓋！
+                    # 覆蓋邏輯
                     if py_summary or py_header.get("job_no"):
-                        print(f"✅ [移花接木啟動] 來源模式: {source_method}")
+                        print(f"✅ [移花接木啟動] 模式: {source_method}")
+                        
                         if py_header.get("job_no"):
                             if "header_info" not in res_main: res_main["header_info"] = {}
                             res_main["header_info"]["job_no"] = py_header["job_no"]
-                        
+                            print(f"   -> 工令: {py_header['job_no']}")
+
                         if py_header.get("scheduled_date"):
                             if "header_info" not in res_main: res_main["header_info"] = {}
                             res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
                             res_main["header_info"]["actual_date"] = py_header["actual_date"]
+                            print(f"   -> 日期: {py_header['scheduled_date']} / {py_header['actual_date']}")
 
                         if py_summary:
                             res_main["summary_rows"] = py_summary
-                            print(f"   -> 已覆蓋總表，共 {len(py_summary)} 筆數據")
+                            print(f"   -> 總表: 覆蓋 {len(py_summary)} 筆數據")
+                    else:
+                        print(f"⚠️ [移花接木落空] Python 沒抓到東西 (請檢查切割內容預覽)")
 
             except Exception as e:
                 print(f"❌ [移花接木失敗] 錯誤原因: {e}")
