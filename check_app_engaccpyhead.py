@@ -548,15 +548,16 @@ def agent_unified_check(combined_input, full_text_for_search, api_key, model_nam
         dynamic_rules = ""
 
     # 2. 定義 Prompt (Python 協作版 - AI 專注於明細)
+        # 2. 定義 Prompt (V10: 手術刀分流專用版)
     base_prompt = """
     角色：專業的工程數據提取程式。
-    任務：忽略上半部總表，僅針對下半部 [明細規格表] 進行深度解析與抄錄。
+    現況：輸入資料已經過前處理，僅包含文件的 **[下半部明細規格區]**。
     
-    ### ⚠️ 邊界指令
-    1. **忽略總表**：上半部的「申請數量、實交數量、預定/實際日期」由外部程式處理，JSON 中請回傳空值即可。
-    2. **專注明細**：全神貫注於下半部的規格敘述與實測數據。
+    ### ⚠️ 重要認知
+    1. **無總表**：輸入文本不包含表頭的申請/實交數量，請勿嘗試尋找或臆測。
+    2. **頁碼識別**：請依據文本中的 `=== Page X ===` 標記來確認頁碼。
     
-    ### 1. 明細表數據 (來源: 下半部 === [DETAIL_TABLE] ===)
+    ### 1. 明細表數據 (來源: 輸入文本)
     - **item_title**: 完整抄錄規格欄左側的標題，嚴禁遺漏「未再生、銲補、車修、軸頸」等關鍵字。
     - **std_spec**: 抄錄含 `mm, ±, +, -` 的規格文字。
     - **item_pc_target**: 提取標題最後一個括號內數字 (如 `(4SET)`->`4`), 無則 `0`。
@@ -571,7 +572,7 @@ def agent_unified_check(combined_input, full_text_for_search, api_key, model_nam
       
     - **category**: 固定回傳 `null`。
     
-    ### 2. 總表數據 (Python 已接管，AI 請留空)
+    ### 2. 結構回傳 (AI 留空，由外部 Python 接管)
     - **summary_rows**: 回傳空陣列 `[]`。
     - **header_info**: 回傳空物件 `{}`。
     
