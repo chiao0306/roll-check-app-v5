@@ -1955,19 +1955,28 @@ if st.session_state.photo_gallery:
             ocr_start = time.time()
             
             def process_task(index, item):
-                if item.get('full_text'): return index, item.get('header_text',''), item['full_text'], None
+                if item.get('full_text'): return index, item.get('header_text',''), item['full_text'], None, None # 多回傳一個 None
                 try:
                     item['file'].seek(0)
-                    _, h, f, _, _ = extract_layout_with_azure(item['file'], DOC_ENDPOINT, DOC_KEY)
-                    return index, h, f, None
-                except Exception as e: return index, None, None, str(e)
+                    # 🔥 修改：把 result 接住 (變數 r)
+                    r, h, f, _, _ = extract_layout_with_azure(item['file'], DOC_ENDPOINT, DOC_KEY)
+                    return index, h, f, r, None # 🔥 回傳 r
+                except Exception as e: return index, None, None, None, str(e)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(process_task, i, item) for i, item in enumerate(st.session_state.photo_gallery)]
                 for future in concurrent.futures.as_completed(futures):
-                    idx, h_txt, f_txt, err = future.result()
+                    # 🔥 修改：接收 result (變數 azure_r)
+                    idx, h_txt, f_txt, azure_r, err = future.result()
                     if not err:
-                        st.session_state.photo_gallery[idx].update({'header_text': h_txt, 'full_text': f_txt, 'file': None})
+                        # 🔥 修改：把 azure_result 存進去
+                        st.session_state.photo_gallery[idx].update({
+                            'header_text': h_txt, 
+                            'full_text': f_txt, 
+                            'file': None,
+                            'azure_result': azure_r # 存起來！
+                        })
+
                     progress_bar.progress(0.4 * ((idx + 1) / len(st.session_state.photo_gallery)))
 
             ocr_duration = time.time() - ocr_start
@@ -2033,6 +2042,35 @@ if st.session_state.photo_gallery:
                 combined_input += f"\n=== Page {i+1} ===\n{p.get('full_text','')}\n"
             
             ai_duration = time.time() - ai_start_time
+            
+            # -----------------------------------------------------------
+            # ✂️ [新增功能] 移花接木手術：用 Python 強制覆蓋總表數據
+            # -----------------------------------------------------------
+            # 確保我們有 Azure 的原始結果 (all_pages 裡面存有原始資訊嗎？)
+            # 注意：這裡我們需要 Azure 原始物件。
+            # 由於您的架構是並行處理，Azure 的原始 result 物件可能沒有被完整保留在 res_main。
+            # 但我們可以針對第一頁 (通常總表在第一頁) 重新抓取或從 session_state 找。
+            
+            # 💡 修正策略：因為您的架構是把每一頁的文字存下來，沒有留 Azure Result 物件。
+            # 如果要實現這個功能，您需要在 OCR 階段把 Azure Result 暫存起來，或者在這裡針對第一頁重跑一次 Table Extract。
+            
+            # 假設您的 OCR 階段有保留 Azure Result (建議修改 OCR 區塊回傳 result 物件)
+            # 如果沒有，這裡示範如何 "針對第一頁" 快速重抓 (不耗 Token，只耗 Azure 運算)
+            try:
+                if st.session_state.photo_gallery:
+                    first_page_item = st.session_state.photo_gallery[0]
+                    # 這裡假設您有辦法拿到 Azure 的原始物件，若無，您可能需要修改 OCR 區塊
+                    # 或者，如果您在 OCR 階段有把 result 存進 session_state，就可以拿來用。
+                    pass 
+            except:
+                pass
+            
+            # ⚠️ 重要提示：
+            # 您的程式碼目前只有存 'full_text'，沒有存 Azure 的 'result' 物件。
+            # 要啟用「Python 總表提取」，您必須在上面的 OCR 階段 (第 155 行附近)
+            # 把 Azure 回傳的 result 物件也存進 st.session_state.photo_gallery 裡。
+            # -----------------------------------------------------------
+
             
             # ========================================================
             # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
