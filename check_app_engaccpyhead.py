@@ -586,33 +586,25 @@ import re # 記得引入 re
 
 def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
     """
-    Python 明細提取器 (V3: 含 PC Target 與 Batch Qty 提取版)
+    Python 明細提取器 (V3+: 寬容搜尋版)
+    修正：解決 Column 0 空白導致標題抓不到的問題
     """
     extracted_items = []
     
-    # 內建小幫手：從標題提取 (10PC)
+    # 小幫手維持不變...
     def extract_pc_target(title):
-        # 支援半形() 與 全形（）
-        # 找括號內的數字 + 單位 (PC, SET, EA...)
         match = re.search(r"[\(\（]\s*(\d+)\s*(PC|SET|EA|UNIT|組|件|式|台|顆)", title, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
+        if match: return int(match.group(1))
         return 0
 
-    # 內建小幫手：從規格提取總量 (針對熱處理/研磨)
     def extract_batch_qty(title, spec):
-        # 只有特定關鍵字才去抓
         keywords = ["熱處理", "研磨", "動平衡", "Heat", "Grind"]
         if any(k in title for k in keywords):
-            # 找數字 + 單位 (KG, M...)
-            # 排除掉像是 ±10 這種公差數字
-            # 策略：找比較大的數字，或者明確接 KG 的
             match = re.search(r"(\d+)\s*(KG|M|G)", spec, re.IGNORECASE)
-            if match:
-                return int(match.group(1))
+            if match: return int(match.group(1))
         return 0
 
-    # --- 狀態恢復 ---
+    # 狀態恢復
     if pending_item:
         current_title = pending_item.get('title')
         current_spec = pending_item.get('spec')
@@ -624,24 +616,30 @@ def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
         current_measurements = []
         state = 'EXPECT_TITLE'
 
-    # 略過表頭
-    start_row_idx = 0
-    if len(azure_table_rows) > 0:
-        header_txt = "".join([c.content for c in azure_table_rows[0].cells])
-        if "規範" in header_txt or "尺寸" in header_txt:
-            start_row_idx = 1
-
     # --- 掃描開始 ---
-    for row in azure_table_rows[start_row_idx:]:
-        col0_text = ""
+    # 這裡我們不預設 start_row_idx，而是動態判斷
+    
+    for row_idx, row in enumerate(azure_table_rows):
         row_data = {}
         max_col_idx = 0
         
+        # 1. 建立該行的資料地圖
         for cell in row.cells:
             txt = cell.content.strip()
             row_data[cell.column_index] = txt
             if cell.column_index > max_col_idx: max_col_idx = cell.column_index
-            if cell.column_index == 0: col0_text = txt
+
+        # 2. 抓取標題候選人 (Column 0 優先，若是空的找 Column 1)
+        # 這樣就算 Azure 把它歪到第二格，我們也能抓到
+        col0_text = row_data.get(0, "")
+        if not col0_text and row_data.get(1, "") and not row_data.get(2, ""):
+             # 如果第0格空，第1格有字，且第2格空(代表不是數據行) -> 假設第1格是標題
+             col0_text = row_data.get(1, "")
+
+        # 3. 判斷是否為表頭 (如果是"規範"、"尺寸"這行，就跳過)
+        all_text = "".join(row_data.values())
+        if "規範" in all_text and "尺寸" in all_text:
+            continue
 
         # --- 狀態機邏輯 ---
         if state == 'EXPECT_TITLE':
@@ -651,42 +649,48 @@ def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
                 state = 'EXPECT_SPEC'
 
         elif state == 'EXPECT_SPEC':
+            # 規格通常在 title 的下一行 (同樣位置)
+            # 但有時候規格會跟 title 在同一行 (OCR 誤判合併)
+            # 這裡我們簡單處理：只要有 title，下一行有字就當規格
             current_spec = col0_text
             state = 'OVERFLOW' 
 
         elif state == 'OVERFLOW':
             if col0_text:
-                # 遇到新項目 -> 結算上一個
+                # 遇到新標題 -> 結算上一個
                 if current_title:
-                    # 🔥 [關鍵新增] 結算時順便計算 Target & Batch Qty
                     extracted_items.append({
                         "item_title": current_title,
                         "std_spec": current_spec,
                         "ds": "|".join(current_measurements),
-                        "item_pc_target": extract_pc_target(current_title), # 這裡抓 (PC)
-                        "batch_total_qty": extract_batch_qty(current_title, current_spec) # 這裡抓 KG
+                        "item_pc_target": extract_pc_target(current_title),
+                        "batch_total_qty": extract_batch_qty(current_title, current_spec)
                     })
                 
+                # 開啟新的一輪
                 current_title = col0_text
                 current_spec = ""
                 current_measurements = [] 
                 state = 'EXPECT_SPEC'
             else:
+                # 沒標題，代表還是在原本項目的範圍內 (可能是更多數據)
                 pass
         
-        # --- 數據收集 (Cols 1~14) ---
-        for c_id in range(1, 15, 2): 
-            c_val = c_id + 1
-            if c_id > max_col_idx: break
-
-            id_txt = row_data.get(c_id, "").strip().replace("\n", "")
-            val_txt = row_data.get(c_val, "").strip().replace("\n", "")
+        # --- 數據收集 (修正：全行掃描) ---
+        # 你的數據格式：編號(ID) : 數值(Val)
+        # 我們直接掃描所有格子，尋找符合 "ID:Val" 格式的內容
+        # 這樣就不用管它是在第幾格了
+        for c_idx, txt in row_data.items():
+            # 排除掉標題欄 (col 0 or col 1)
+            if c_idx <= 1 and (txt == current_title or txt == current_spec):
+                continue
             
-            if id_txt or val_txt:
-                current_measurements.append(f"{id_txt}:{val_txt}")
+            # 簡單清洗
+            clean_txt = txt.replace("\n", "").replace(" ", "")
+            if ":" in clean_txt and len(clean_txt) > 2:
+                current_measurements.append(clean_txt)
 
-    # --- 處理換頁 Pending 狀態 ---
-    # 注意：這裡只回傳狀態，不回傳 items，避免跨頁重複存
+    # --- 迴圈結束，處理最後一筆 ---
     pending_state = {
         'title': current_title,
         'spec': current_spec,
