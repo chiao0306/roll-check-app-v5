@@ -2363,72 +2363,62 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-        # --- 情況 C: 上傳 Excel (新增的放在這) ---
- 
     elif data_source == "📊 上傳 Excel 檔":
         st.info("💡 直接讀取 Excel 原始檔，數據最精準！")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
-            if st.button("🚀 開始分析 Excel", type="primary"):
-                with st.status("正在解析 Excel...", expanded=True) as status:
-                    
-                    # 1. 呼叫剛剛寫的函式
+            # 使用 callback 機制，避免按鈕狀態重置問題
+            def process_excel():
+                with st.spinner("正在解析 Excel..."): # 改用 spinner，不會有收合動畫的問題
+                    # 1. 呼叫函式
                     h_info, s_rows, dim_data, err = python_process_excel_upload(uploaded_xlsx)
                     
                     if err:
                         st.error(f"解析失敗: {err}")
-                    else:
-                        st.success(f"成功提取！抓到 {len(dim_data)} 筆明細")
-                        
-                        # 2. 為了讓後面的 Python 邏輯 (會計/工程引擎) 能跑
-                        # 我們要把這些數據包裝成原本的 Cache 格式
-                        
-                        # 補上分類 (Category)
-                        for item in dim_data:
-                            new_cat = assign_category_by_python(item.get("item_title", ""))
-                            item["category"] = new_cat
-                            item["sl"] = {"lt": new_cat} # 讓工程引擎讀得到
-                        
-                        # 執行 Python 稽核 (數值、會計、流程)
-                        python_numeric_issues = python_numerical_audit(dim_data)
-                        python_accounting_issues = python_accounting_audit(dim_data, {"summary_rows": s_rows})
-                        python_process_issues = python_process_audit(dim_data)
-                        
-                        all_issues = python_numeric_issues + python_accounting_issues + python_process_issues
+                        return # 失敗就停住，不要 rerun
 
-                        # 3. 存入 Session State
-                        st.session_state.analysis_result_cache = {
-                            "job_no": h_info.get("job_no", "Unknown"),
-                            "header_info": h_info,
-                            "all_issues": all_issues,
-                            "total_duration": 0.5, # Excel 很快
-                            "ocr_duration": 0,
-                            "ai_duration": 0,
-                            "py_duration": 0.5,
-                            "cost_twd": 0,
-                            "total_in": 0,
-                            "total_out": 0,
-                            "ai_extracted_data": dim_data,
-                            "summary_rows": s_rows,
-                            "full_text_for_search": "Excel Source",
-                            "combined_input": "Excel Source"
-                        }
-                        st.rerun()
+                    # 2. 補上分類與其他必要資訊 (讓後續引擎能跑)
+                    for item in dim_data:
+                        # 補分類
+                        new_cat = assign_category_by_python(item.get("item_title", ""))
+                        item["category"] = new_cat
+                        if "sl" not in item: item["sl"] = {"lt": new_cat}
+                        
+                        # 補預設值 (防呆)
+                        if "item_pc_target" not in item: item["item_pc_target"] = 0
+                        if "batch_total_qty" not in item: item["batch_total_qty"] = 0
 
-if st.session_state.photo_gallery:
-    st.caption(f"已累積 {len(st.session_state.photo_gallery)} 頁文件")
-    col_btn1, col_btn2 = st.columns([1, 1], gap="small")
-    with col_btn1: start_btn = st.button("🚀 開始分析", type="primary", use_container_width=True)
-    with col_btn2: 
-        clear_btn = st.button("🗑️照片清除", help="清除", use_container_width=True)
+                    # 3. 執行 Python 稽核
+                    python_numeric_issues = python_numerical_audit(dim_data)
+                    python_accounting_issues = python_accounting_audit(dim_data, {"summary_rows": s_rows})
+                    python_process_issues = python_process_audit(dim_data)
+                    python_header_issues = [] # Excel 通常沒header問題
 
-    if clear_btn:
-        st.session_state.photo_gallery = []
-        st.session_state.analysis_result_cache = None
-        if 'last_loaded_json_name' in st.session_state:
-            del st.session_state.last_loaded_json_name 
-        st.rerun()
+                    all_issues = python_numeric_issues + python_accounting_issues + python_process_issues
+
+                    # 4. 存入 Session State (這是關鍵！)
+                    st.session_state.analysis_result_cache = {
+                        "job_no": h_info.get("job_no", "Unknown"),
+                        "header_info": h_info,
+                        "all_issues": all_issues,
+                        "total_duration": 0.5,
+                        "ocr_duration": 0,
+                        "ai_duration": 0,
+                        "py_duration": 0.5,
+                        "cost_twd": 0,
+                        "total_in": 0,
+                        "total_out": 0,
+                        "ai_extracted_data": dim_data,
+                        "summary_rows": s_rows,
+                        "full_text_for_search": "Excel Source",
+                        "combined_input": "Excel Source"
+                    }
+                    
+                    st.toast(f"✅ 成功提取 {len(dim_data)} 筆明細！", icon="🎉")
+            
+            # 按鈕觸發
+            st.button("🚀 開始分析 Excel", type="primary", on_click=process_excel)
 
     is_auto_start = st.session_state.auto_start_analysis
     if is_auto_start:
