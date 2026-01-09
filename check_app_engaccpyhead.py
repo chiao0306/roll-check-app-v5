@@ -535,45 +535,59 @@ def cut_text_for_processing(full_text):
         # 為了安全，假設整頁都是明細 (避免 AI 漏看)，但標記無法區分
         return full_text, full_text 
         
+import re # 記得引入 re
+
 def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
     """
-    Python 明細提取器 (V2: 交錯換列邏輯版)
-    解析邏輯：
-      - Row N (Col 0有字): 新項目名稱 (Item Title) -> 開始收集數據
-      - Row N+1 (通常): 規範標準 (Std Spec) -> 繼續收集數據
-      - Row N+2 (Col 0空白): 數據太多換列 (Overflow) -> 繼續收集數據
-    支援跨頁：
-      - 透過 pending_item 參數接收上一頁沒做完的項目。
+    Python 明細提取器 (V3: 含 PC Target 與 Batch Qty 提取版)
     """
     extracted_items = []
     
-    # 狀態變數初始化
+    # 內建小幫手：從標題提取 (10PC)
+    def extract_pc_target(title):
+        # 支援半形() 與 全形（）
+        # 找括號內的數字 + 單位 (PC, SET, EA...)
+        match = re.search(r"[\(\（]\s*(\d+)\s*(PC|SET|EA|UNIT|組|件|式|台|顆)", title, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    # 內建小幫手：從規格提取總量 (針對熱處理/研磨)
+    def extract_batch_qty(title, spec):
+        # 只有特定關鍵字才去抓
+        keywords = ["熱處理", "研磨", "動平衡", "Heat", "Grind"]
+        if any(k in title for k in keywords):
+            # 找數字 + 單位 (KG, M...)
+            # 排除掉像是 ±10 這種公差數字
+            # 策略：找比較大的數字，或者明確接 KG 的
+            match = re.search(r"(\d+)\s*(KG|M|G)", spec, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return 0
+
+    # --- 狀態恢復 ---
     if pending_item:
         current_title = pending_item.get('title')
         current_spec = pending_item.get('spec')
         current_measurements = pending_item.get('measurements', [])
-        # 如果上一頁還在做某個項目，狀態設為 OVERFLOW (繼續收集)
         state = 'OVERFLOW' 
     else:
         current_title = None
         current_spec = None
         current_measurements = []
-        state = 'EXPECT_TITLE' # 初始狀態：等待新項目
+        state = 'EXPECT_TITLE'
 
-    # 略過表頭 (如果第一列有"規範"或"尺寸"關鍵字)
+    # 略過表頭
     start_row_idx = 0
     if len(azure_table_rows) > 0:
         header_txt = "".join([c.content for c in azure_table_rows[0].cells])
         if "規範" in header_txt or "尺寸" in header_txt:
             start_row_idx = 1
 
-    # 開始掃描每一列
+    # --- 掃描開始 ---
     for row in azure_table_rows[start_row_idx:]:
-        # 1. 取得左側 (Col 0) 文字
-        # 注意：Azure 的 cells 是平面清單，需轉換或搜尋
-        # 這裡假設傳進來的是已經轉好的 row 物件 (我們會在其後的主程式處理轉換)
         col0_text = ""
-        row_data = {} # 用 dict 存這一列的 cell，方便查找 col index
+        row_data = {}
         max_col_idx = 0
         
         for cell in row.cells:
@@ -582,56 +596,50 @@ def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
             if cell.column_index > max_col_idx: max_col_idx = cell.column_index
             if cell.column_index == 0: col0_text = txt
 
-        # 2. 判斷這一列是甚麼身分 (狀態機核心)
+        # --- 狀態機邏輯 ---
         if state == 'EXPECT_TITLE':
             if col0_text:
-                # 發現新項目！
                 current_title = col0_text
-                current_spec = "" # 先清空，下一列才會是 spec
+                current_spec = "" 
                 state = 'EXPECT_SPEC'
-            # 若 col0 空白則跳過 (可能是雜訊)
 
         elif state == 'EXPECT_SPEC':
-            # 依據邏輯，標題的下一列通常是規範 (不管有無文字)
-            # 除非是緊接著另一個新項目(極少見)，我們假設它是規範
             current_spec = col0_text
-            state = 'OVERFLOW' # 接下來都是數據換列區，直到遇到新標題
+            state = 'OVERFLOW' 
 
         elif state == 'OVERFLOW':
             if col0_text:
-                # 在換列區發現左邊有字 -> 代表是「新項目」開始了！
-                # 1. 先把舊的存起來 (Commit)
+                # 遇到新項目 -> 結算上一個
                 if current_title:
+                    # 🔥 [關鍵新增] 結算時順便計算 Target & Batch Qty
                     extracted_items.append({
                         "item_title": current_title,
                         "std_spec": current_spec,
-                        "ds": "|".join(current_measurements)
+                        "ds": "|".join(current_measurements),
+                        "item_pc_target": extract_pc_target(current_title), # 這裡抓 (PC)
+                        "batch_total_qty": extract_batch_qty(current_title, current_spec) # 這裡抓 KG
                     })
                 
-                # 2. 開啟新項目
                 current_title = col0_text
                 current_spec = ""
-                current_measurements = [] # 重置數據籃子
+                current_measurements = [] 
                 state = 'EXPECT_SPEC'
             else:
-                # 左邊空白 -> 這是同一個項目的換列數據 (Continue)
                 pass
         
-        # 3. 收集右邊的數據 (Col 1~14)
-        # 邏輯：Col 1:ID, Col 2:Val | Col 3:ID, Col 4:Val ...
-        # 兩兩一組，直到列尾
-        for c_id in range(1, 15, 2): # 1, 3, 5, 7, 9, 11, 13
+        # --- 數據收集 (Cols 1~14) ---
+        for c_id in range(1, 15, 2): 
             c_val = c_id + 1
-            if c_id > max_col_idx: break # 超出範圍
+            if c_id > max_col_idx: break
 
             id_txt = row_data.get(c_id, "").strip().replace("\n", "")
             val_txt = row_data.get(c_val, "").strip().replace("\n", "")
             
-            # 只要 ID 有值 (或是 Value 有值)，就算一筆
             if id_txt or val_txt:
                 current_measurements.append(f"{id_txt}:{val_txt}")
 
-    # 這一頁跑完了，回傳結果 + 待續狀態 (給下一頁用)
+    # --- 處理換頁 Pending 狀態 ---
+    # 注意：這裡只回傳狀態，不回傳 items，避免跨頁重複存
     pending_state = {
         'title': current_title,
         'spec': current_spec,
