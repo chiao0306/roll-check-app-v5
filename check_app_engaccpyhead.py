@@ -2301,9 +2301,8 @@ if st.session_state.photo_gallery:
                     progress_bar.progress(0.4 * ((idx + 1) / len(st.session_state.photo_gallery)))
             
             ocr_duration = time.time() - ocr_start
-
             # ==========================================
-            # 🐍 2. Python 全面提取 (明細 + 總表) - 雙重保障版
+            # 🐍 2. Python 全面提取 (明細 + 總表) - JSON 針對優化版
             # ==========================================
             status_box.write("⚡ 正在執行 Python 結構化提取 (啟動雙重保障機制)...")
             py_extract_start = time.time()
@@ -2322,44 +2321,54 @@ if st.session_state.photo_gallery:
             # 跨頁狀態傳遞器
             pending_detail_item = None 
 
-            # --- 定義 B 計畫函式 (放在這裡確保執行得到) ---
+            # --- 🔥 B 計畫函式 (針對你的 JSON 優化 Regex) ---
             def python_extract_detail_from_raw_text(full_text, page_num):
                 import re
                 extracted = []
                 if not full_text: return []
 
                 # 1. 定位明細起始點
-                start_keywords = ["規範", "規格", "尺寸", "檢驗紀錄", "ITEM", "SPEC", "規 範"]
+                # 你的 JSON 顯示下方數據前有這些關鍵字，我們用來切掉上面的總表
+                start_keywords = ["規格標準", "檢驗紀錄", "尺寸", "SPEC", "ITEM", "規 範"]
                 start_idx = -1
                 for k in start_keywords:
                     idx = full_text.find(k)
                     if idx != -1:
                         if start_idx == -1 or idx < start_idx: start_idx = idx
                 
-                target_text = full_text[start_idx:] if start_idx != -1 else full_text[len(full_text)//3:]
+                # 如果找不到關鍵字，就切掉前 1/4 (避開總表)
+                target_text = full_text[start_idx:] if start_idx != -1 else full_text[len(full_text)//4:]
                 
-                # 2. 數據抓取 (格式: 編號:數值)
+                # 2. 數據抓取
+                # 你的 JSON 裡有 "1 :140.02" 這種格式 (冒號前有空格)
                 lines = target_text.split('\n')
-                curr_title = "未命名項目(B計畫)"
+                curr_title = "未命名項目(純文字)"
                 curr_spec = ""
                 curr_meas = []
                 
-                # 簡單過濾雜訊用的 Regex
+                # Regex 重點：
+                # (\d+)      -> 抓編號 (Group 1)
+                # \s*[:：]\s* -> 抓冒號 (允許前後有空格，支援全形半形)
+                # ([-+]?\d+\.?\d*|OK|N/A|M\d+|\[!\]) -> 抓數值 (Group 2)
                 pattern_data = re.compile(r"(\d+)\s*[:：]\s*([-+]?\d+\.?\d*|OK|N/A|M\d+|\[!\])")
 
                 for line in lines:
                     line = line.strip()
                     if not line: continue
                     
+                    # 掃描這一行有沒有數據
                     matches = pattern_data.findall(line)
+                    
                     if matches:
-                        # 這一行是數據
+                        # 這一行是數據 (例如 "1 :140.02")
                         for m in matches:
                             curr_meas.append(f"{m[0]}:{m[1]}")
                     else:
-                        # 這一行可能是標題或規格
+                        # 這一行不是數據 -> 可能是標題或規格
+                        # 過濾雜訊
                         if len(line) < 2 or line.isdigit(): continue
-                        if "規範" in line or "尺寸" in line or "檢驗" in line: continue
+                        # 跳過表頭關鍵字
+                        if any(x in line for x in ["規範", "尺寸", "檢驗", "位置", "編號", "實測"]): continue
                         
                         # 如果已經有累積數據，先結算上一筆
                         if curr_meas:
@@ -2368,7 +2377,7 @@ if st.session_state.photo_gallery:
                                 "item_title": curr_title,
                                 "std_spec": curr_spec,
                                 "ds": "|".join(curr_meas),
-                                "item_pc_target": 0, # B計畫很難抓這些，先給0
+                                "item_pc_target": 0,
                                 "batch_total_qty": 0,
                                 "category": None
                             })
@@ -2376,11 +2385,12 @@ if st.session_state.photo_gallery:
                             curr_spec = ""
                         
                         # 判定標題/規格
-                        if "mm" in line.lower() or "±" in line or "+" in line:
+                        # 你的 JSON 規格通常含 φ, +, -, mm
+                        if any(x in line for x in ["mm", "MM", "±", "+", "-", "φ", "Ø"]):
                             curr_spec = line
                         else:
-                            # 簡單防雜訊
-                            if len(line) > 30 and " " in line: pass 
+                            # 簡單防雜訊 (太長通常是備註)
+                            if len(line) > 40: pass 
                             else: curr_title = line
                 
                 # 結算最後一筆
@@ -2402,14 +2412,13 @@ if st.session_state.photo_gallery:
                 page_num = i + 1
                 azure_result = p.get('azure_result')
                 
-                has_extracted_detail = False # 🚩 標記：這頁有沒有抓到明細？
+                has_extracted_detail = False # 🚩 標記
 
-                # --- A. Azure 表格模式 (首選) ---
+                # --- A. Azure 表格模式 ---
                 if azure_result and hasattr(azure_result, 'tables'):
                     print(f"📄 Page {page_num}: Azure 發現 {len(azure_result.tables)} 個表格")
                     
                     for t_idx, table in enumerate(azure_result.tables):
-                        # 簡單判斷
                         header_txt = ""
                         if len(table.rows) > 0:
                             header_txt = "".join([c.content for c in table.rows[0].cells])
@@ -2425,40 +2434,34 @@ if st.session_state.photo_gallery:
                             print(f"   -> [Table {t_idx+1}] 偵測到總表")
                             _, s_rows = python_extract_summary_strict(azure_result)
                             if s_rows: all_summary_rows.extend(s_rows)
-                        
                         else:
-                            # 只要不是總表，就當明細表處理
-                            print(f"   -> [Table {t_idx+1}] 嘗試提取明細 (Row0: {header_txt[:10]}...)")
-                            
-                            # 呼叫 V2 (請確保你有更新 V2 函式)
+                            # 嘗試抓明細 (雖然你的 JSON 裡這裡通常抓不到，但保留邏輯)
+                            print(f"   -> [Table {t_idx+1}] 嘗試提取明細...")
                             d_rows, next_pending = python_extract_detail_table_v2(table.rows, pending_detail_item)
-                            
                             for d in d_rows: d['page'] = page_num
-                                
                             if d_rows:
                                 all_dim_data.extend(d_rows)
-                                has_extracted_detail = True # 成功抓到！
+                                has_extracted_detail = True
                                 print(f"      ✅ Azure 表格提取成功: {len(d_rows)} 筆")
-                            
                             pending_detail_item = next_pending
                             
-                    # 抓表頭資訊
+                    # 抓表頭
                     h_info, _ = python_extract_summary_text_fallback([p])
                     if h_info.get("job_no"): final_header_info["job_no"] = h_info["job_no"]
                     if h_info.get("scheduled_date"): 
                         final_header_info["scheduled_date"] = h_info["scheduled_date"]
                         final_header_info["actual_date"] = h_info["actual_date"]
 
-                # --- B. 純文字暴力模式 (如果 Azure 表格失效) ---
+                # --- 🔥 B. 純文字暴力模式 (這裡會發威！) ---
                 if not has_extracted_detail:
-                    print(f"⚠️ Page {page_num}: Azure 表格模式失效，啟動 B 計畫 (Regex)...")
+                    print(f"⚠️ Page {page_num}: Azure 表格模式無效，啟動 B 計畫 (Regex)...")
                     
+                    # 優先讀取 full_text
                     full_txt = p.get('full_text', '')
-                    # 如果 full_text 是空的，試著從 azure_result 拿
+                    # 如果是空的，試著從 azure_result 還原
                     if not full_txt and azure_result:
                          full_txt = azure_result.content
                     
-                    # 呼叫上面定義的 B 計畫函式
                     raw_items = python_extract_detail_from_raw_text(full_txt, page_num)
                     
                     if raw_items:
@@ -2467,7 +2470,7 @@ if st.session_state.photo_gallery:
                     else:
                         print(f"   ❌ B 計畫也未發現數據。")
             
-            # 迴圈結束後，存入最後一筆 pending
+            # 結算 pending
             if pending_detail_item and pending_detail_item['title']:
                 all_dim_data.append({
                     "page": len(st.session_state.photo_gallery),
@@ -2479,12 +2482,12 @@ if st.session_state.photo_gallery:
                     "category": None
                 })
 
-            # 彙整結果
+            # 彙整
             res_main["header_info"] = final_header_info
             res_main["summary_rows"] = all_summary_rows
             res_main["dimension_data"] = all_dim_data
             
-            # 欄位補全
+            # 補全欄位
             for item in res_main["dimension_data"]:
                 if "item_pc_target" not in item: item["item_pc_target"] = 0
                 if "batch_total_qty" not in item: item["batch_total_qty"] = 0
