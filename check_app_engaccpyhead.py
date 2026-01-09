@@ -387,10 +387,11 @@ def python_extract_summary_strict(azure_result):
     
 def python_extract_summary_text_fallback(photo_gallery_items):
     """
-    Python 總表提取 (B計畫 - V8 上下行雷達版)：
-    1. 【日期雷達】強搜「當前行」與「下一行」，解決合併儲存格導致日期換行的問題。
-    2. 【ROC優化】針對 113.xx.xx 或 115.xx.xx 格式強化 Regex。
-    3. 【數量防沾黏】堅持雙刀流策略，先挖日期、再抓數量，確保數字不打架。
+    Python 總表提取 (B計畫 - V9 區塊鎖定版)：
+    解決痛點：
+    1. 解決「全部沒抄到」：不再依賴換行符號，改用「區塊切割」抓取數據。
+    2. 解決「日期沒抓到」：自動將兩個項目之間的所有文字視為搜尋範圍，不管日期掉到哪一行都能抓。
+    3. 解決「數量誤判」：維持雙刀流，先挖日期、再抓數量。
     """
     import re
     header_info = {}
@@ -401,125 +402,102 @@ def python_extract_summary_text_fallback(photo_gallery_items):
     # 1. 抓工令 (掃描前兩頁)
     for i in range(min(2, len(photo_gallery_items))):
         full_text = photo_gallery_items[i].get('full_text', '')
-        # 允許冒號後面有空格、換行或直槓
         job_match = re.search(r"工令編號[:：\s\|]*([WROY]\w+)", full_text, re.IGNORECASE)
         if job_match: 
             header_info["job_no"] = job_match.group(1).strip()
             break 
 
     # 2. 定義解析邏輯
+    # 單位白名單 (可依需求擴充)
     units = r"(PC|SET|EA|UNIT|KG|M|組|件|式|台|顆)"
     
-    # 行首 Regex: 抓取「項次 -> 名稱 -> 單位」 (遇到單位就停止，後面留給第二階段)
+    # 錨點 Regex: 鎖定「項次...名稱...單位」
+    # 使用 multiline 確保能抓到每一項的開頭
     pattern_head = re.compile(
         rf"^\s*\|?\s*(\d+)\s*\|?\s*"      # Group 1: 項次
         rf"(.+?)\s*\|?\s*"                # Group 2: 名稱
         rf"{units}\s*\|?"                 # Group 3: 單位
+        , re.MULTILINE
     )
     
-    # 日期 Regex (超級寬容版)
-    # 支援: 115.01.09 | 114/12/1 | 2026-01-09
-    # 特點: 允許中間有空格 (115 . 01 . 09)
+    # 日期 Regex (支援 ROC/西元, 允許空格/分隔符)
     date_pattern = r"(\d{2,4}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{1,2})"
 
     for page_idx, item in enumerate(photo_gallery_items):
         full_text = item.get('full_text', '')
         if not full_text: continue
         
-        lines = full_text.split('\n')
-        skip_next_line = False # 標記旗標：若日期在下一行被抓走了，下一輪迴圈就跳過該行
+        # 步驟 A: 找出所有項目的「錨點」(Head)
+        matches = list(pattern_head.finditer(full_text))
         
-        for i, line in enumerate(lines):
-            # 如果這一行已經被當作「上一行的日期」處理過了，就跳過
-            if skip_next_line:
-                skip_next_line = False
-                continue
-            
-            # 1. 掃描行首 (鎖定目標)
-            match = pattern_head.search(line)
-            if match:
-                try:
-                    # --- A. 基礎資訊 ---
-                    idx_str = match.group(1).strip()
-                    name = match.group(2).strip().replace("|", "")
-                    unit = match.group(3).strip()
-                    
-                    if name.isdigit() or len(name) < 2: continue
+        for i, match in enumerate(matches):
+            try:
+                # 取得基礎資訊
+                idx_str = match.group(1).strip()
+                name = match.group(2).strip().replace("|", "")
+                
+                if name.isdigit() or len(name) < 2: continue
 
-                    # 取得「單位」之後的所有文字 (候選字串)
-                    # 例如: "  62    | 115.01.09 | 114.12.01"
-                    current_tail = line[match.end():].strip()
-                    
-                    # --- B. 啟動日期搜索雷達 (Lookahead Radar) ---
-                    dates = []
-                    
-                    # B1. 先搜「當前行」
-                    dates_in_current = re.findall(date_pattern, current_tail)
-                    
-                    # B2. 如果當前行找不到，或者只有 1 個日期 (假設總表通常有預定+實際 2 個)，
-                    # 嘗試偷看「下一行」，看看是不是掉下去了
-                    next_line_dates = []
-                    if i + 1 < len(lines):
-                        next_line = lines[i+1].strip()
-                        # 檢查下一行是否「只包含日期」或「日期開頭」 (避免抓到下一筆項目的數字)
-                        # 這裡我們寬鬆一點，只要下一行有日期格式，就抓抓看
-                        next_line_dates = re.findall(date_pattern, next_line)
-                    
-                    # 決策：日期到底在哪？
-                    if dates_in_current:
-                        dates = dates_in_current
-                    elif next_line_dates:
-                        # 當前行沒日期，但下一行有 -> 認定日期掉到下一行了
-                        dates = next_line_dates
-                        skip_next_line = True # 標記下一行已使用 (它是日期行，不是新項目)
-
-                    # 清洗日期格式 (去掉空格)
-                    clean_dates = [d.replace(" ", "") for d in dates]
-                    sched = clean_dates[0] if len(clean_dates) > 0 else ""
-                    act = clean_dates[1] if len(clean_dates) > 1 else ""
-
-                    # --- C. 處理數量 (雙刀流 V2) ---
-                    # 關鍵：我們要從「包含數量的那個字串」裡面挖數據
-                    # 通常數量一定在「當前行」(current_tail)
-                    
-                    # 1. 先把當前行裡的日期字串挖掉 (如果有)
-                    qty_source = re.sub(date_pattern, "", current_tail)
-                    
-                    # 2. 移除直槓與雜訊
-                    qty_clean = qty_source.replace("|", " ")
-                    
-                    # 3. 抓取剩餘的數字
-                    numbers = re.findall(r"\d+", qty_clean)
-                    
-                    q_apply = 0
+                # 步驟 B: 定義「腹地」(Chunk)
+                # 範圍：從「當前單位結束」一直抓到「下一個項目開始」
+                # 這樣中間夾的所有日期、換行、數字，都會被我們網羅
+                start_pos = match.end()
+                
+                if i + 1 < len(matches):
+                    # 如果後面還有項目，就抓到下個項目的開頭
+                    end_pos = matches[i+1].start()
+                else:
+                    # 如果是最後一項，往後抓 200 個字 (避免抓到頁尾雜訊)
+                    end_pos = min(len(full_text), start_pos + 200)
+                
+                chunk_text = full_text[start_pos:end_pos]
+                
+                # 步驟 C: 在腹地內搜尋數據 (雙刀流)
+                
+                # C1. 先抓日期 (Date Extraction)
+                # 這些日期可能掉在下一行，因為我們抓的是 chunk，所以一定抓得到
+                dates = re.findall(date_pattern, chunk_text)
+                
+                clean_dates = [d.replace(" ", "") for d in dates]
+                sched = clean_dates[0] if len(clean_dates) > 0 else ""
+                act = clean_dates[1] if len(clean_dates) > 1 else ""
+                
+                # C2. 處理數量 (Quantity Extraction)
+                # 把日期從 chunk 中挖掉，剩下的就是數量
+                chunk_no_date = re.sub(date_pattern, "", chunk_text)
+                
+                # 清洗雜訊 (移除直槓、換行)
+                chunk_clean = chunk_no_date.replace("|", " ").replace("\n", " ")
+                numbers = re.findall(r"\d+", chunk_clean)
+                
+                q_apply = 0
+                q_deliver = 0
+                
+                if len(numbers) >= 2:
+                    q_apply = int(numbers[0])
+                    q_deliver = int(numbers[1])
+                elif len(numbers) == 1:
+                    # 只有一個數字 -> 申請數量 (實交為 0)
+                    q_apply = int(numbers[0])
                     q_deliver = 0
-                    
-                    if len(numbers) >= 2:
-                        # 抓到兩個數字 -> 申請、實交
-                        q_apply = int(numbers[0])
-                        q_deliver = int(numbers[1])
-                    elif len(numbers) == 1:
-                        # 只抓到一個數字 -> 申請=數字, 實交=0 (符合您說的「文件是空的」)
-                        q_apply = int(numbers[0])
-                        q_deliver = 0
-                    
-                    # --- D. 存檔 ---
-                    summary_rows.append({
-                        "page": page_idx + 1,
-                        "index": int(idx_str),
-                        "title": name,
-                        "apply_qty": q_apply,
-                        "delivery_qty": q_deliver,
-                        "sched_date": sched,
-                        "actual_date": act
-                    })
-                    
-                    # 更新全域 Header (只要抓到就更新)
-                    if sched and not header_info.get("scheduled_date"): header_info["scheduled_date"] = sched
-                    if act and not header_info.get("actual_date"): header_info["actual_date"] = act
-                    
-                except Exception: 
-                    continue
+                
+                # 步驟 D: 存檔
+                summary_rows.append({
+                    "page": page_idx + 1,
+                    "index": int(idx_str),
+                    "title": name,
+                    "apply_qty": q_apply,
+                    "delivery_qty": q_deliver,
+                    "sched_date": sched,
+                    "actual_date": act
+                })
+                
+                # 更新全域 Header
+                if sched and not header_info.get("scheduled_date"): header_info["scheduled_date"] = sched
+                if act and not header_info.get("actual_date"): header_info["actual_date"] = act
+                
+            except Exception: 
+                continue
 
     return header_info, summary_rows
     
