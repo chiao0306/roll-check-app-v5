@@ -104,6 +104,31 @@ with st.sidebar:
         on_change=update_url_param
     )
 
+# --- [新增] Azure 物件替身 (用於讀取 JSON 時偽裝) ---
+class MockCell:
+    def __init__(self, data):
+        self.content = data.get('content', '')
+        self.column_index = data.get('columnIndex', 0)
+
+class MockRow:
+    def __init__(self, data):
+        self.cells = [MockCell(c) for c in data.get('cells', [])]
+
+class MockTable:
+    def __init__(self, data):
+        self.rows = [MockRow(r) for r in data.get('rows', [])]
+
+class MockAnalyzeResult:
+    def __init__(self, data):
+        # 兼容兩種 JSON 結構 (直接是 tables 或包在 analyzeResult 裡)
+        tables_data = []
+        if 'tables' in data:
+            tables_data = data['tables']
+        elif 'analyzeResult' in data and 'tables' in data['analyzeResult']:
+            tables_data = data['analyzeResult']['tables']
+        
+        self.tables = [MockTable(t) for t in tables_data]
+
 # --- Excel 規則讀取函數 (最終淨化版) ---
 @st.cache_data
 def get_dynamic_rules(ocr_text, debug_mode=False):
@@ -2106,14 +2131,34 @@ with st.container(border=True):
         if uploaded_json:
             try:
                 current_file_name = uploaded_json.name
+                # 只有當檔案不同時才重新讀取，避免重複執行
                 if st.session_state.get('last_loaded_json_name') != current_file_name:
                     json_data = json.load(uploaded_json)
                     st.session_state.photo_gallery = []
                     st.session_state.source_mode = 'json'
                     st.session_state.last_loaded_json_name = current_file_name
                     
-                    import re
+                    import re # 確保 re 模組可用
+                    
                     for page in json_data:
+                        # 1. 嘗試還原 Azure Result (關鍵步驟！)
+                        mock_result = None
+                        raw_data = page.get('raw_json')
+                        
+                        if raw_data:
+                            try:
+                                # 如果 raw_json 是字串，先轉成 dict
+                                if isinstance(raw_data, str):
+                                    raw_dict = json.loads(raw_data)
+                                else:
+                                    raw_dict = raw_data
+                                
+                                # 🪄 施法：將資料復活成物件
+                                mock_result = MockAnalyzeResult(raw_dict)
+                            except Exception as e:
+                                print(f"⚠️ [JSON] 還原 Azure Result 失敗: {e}")
+
+                        # 2. 解析頁碼 (保留您原本的邏輯)
                         real_page = "Unknown"
                         full_text = page.get('full_text', '')
                         if full_text:
@@ -2121,16 +2166,23 @@ with st.container(border=True):
                             if match:
                                 real_page = match.group(1)
                         
+                        # 3. 存入 Photo Gallery
                         st.session_state.photo_gallery.append({
                             'file': None,
                             'table_md': page.get('table_md'),
                             'header_text': page.get('header_text'),
                             'full_text': full_text,
-                            'raw_json': page.get('raw_json'),
-                            'real_page': real_page
+                            'raw_json': page.get('raw_json'), # 保留原始資料
+                            'azure_result': mock_result,      # 🔥 這是新加入的復活物件！
+                            'real_page': real_page,
+                            # 為了相容性，也把切割文字欄位補上
+                            'summary_text': page.get('summary_text', ''),
+                            'detail_text': page.get('detail_text', '')
                         })
                     
-                    st.toast(f"✅ 成功載入 JSON: {current_file_name}", icon="📂")
+                    st.toast(f"✅ 成功載入 JSON: {current_file_name} (含表格結構)", icon="📂")
+                    
+                    # 如果有開啟自動分析，就觸發
                     if st.session_state.enable_auto_analysis:
                         st.session_state.auto_start_analysis = True
                     st.rerun()
