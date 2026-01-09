@@ -325,7 +325,7 @@ def python_extract_summary_strict(azure_result):
     for table in azure_result.tables:
         # 把這個表格的所有內容拼起來檢查有沒有關鍵字
         table_content = "".join([cell.content for cell in table.cells])
-        if "數量" in table_content and "數量" in table_content:
+        if "申請數量" in table_content and "實交數量" in table_content:
             target_table = table
             break
             
