@@ -104,45 +104,38 @@ with st.sidebar:
         on_change=update_url_param
     )
 
-# --- [修正] Azure 物件替身 (自動組裝 Rows 版) ---
+# --- [修正] Azure 物件替身 (V2: 自動組裝 + 雙模式支援) ---
 class MockCell:
     def __init__(self, data):
         self.content = data.get('content', '')
         self.column_index = data.get('columnIndex', 0)
-        self.row_index = data.get('rowIndex', 0) # 補上 rowIndex
+        self.row_index = data.get('rowIndex', 0) 
 
 class MockRow:
     def __init__(self, cells_list):
-        # 這裡接收的已經是篩選過、屬於這一列的 cells 列表
-        self.cells = [MockCell(c) for c in cells_list]
+        # 確保格子依照 column_index 排序，不然數據會亂跳
+        sorted_cells = sorted(cells_list, key=lambda x: x.get('columnIndex', 0))
+        self.cells = [MockCell(c) for c in sorted_cells]
 
 class MockTable:
     def __init__(self, data):
         # 1. 取得所有散落的 cells
         all_cells = data.get('cells', [])
         
-        # 2. 依照 rowIndex 進行分組 (Group by)
+        # [防呆] 支援總表分析：總表引擎會直接讀 table.cells
+        self.cells = [MockCell(c) for c in all_cells]
+        
+        # 2. [關鍵] 依照 rowIndex 進行分組 (Group by) -> 為了明細分析引擎
         rows_map = {}
         for c in all_cells:
             r_idx = c.get('rowIndex', 0)
             if r_idx not in rows_map: rows_map[r_idx] = []
             rows_map[r_idx].append(c)
             
-        # 3. 將分組後的資料轉為 MockRow 物件列表 (按順序)
+        # 3. 將分組後的資料轉為 MockRow 物件列表
         self.rows = []
         for r_idx in sorted(rows_map.keys()):
             self.rows.append(MockRow(rows_map[r_idx]))
-
-class MockAnalyzeResult:
-    def __init__(self, data):
-        # 兼容兩種 JSON 結構
-        tables_data = []
-        if 'tables' in data:
-            tables_data = data['tables']
-        elif 'analyzeResult' in data and 'tables' in data['analyzeResult']:
-            tables_data = data['analyzeResult']['tables']
-        
-        self.tables = [MockTable(t) for t in tables_data]
 
 # --- Excel 規則讀取函數 (最終淨化版) ---
 @st.cache_data
