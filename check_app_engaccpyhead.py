@@ -584,120 +584,102 @@ def cut_text_for_processing(full_text):
         
 import re # 記得引入 re
 
-def python_extract_detail_table_v2(azure_table_rows, pending_item=None):
+def python_extract_detail_from_raw_text(full_text, page_num):
     """
-    Python 明細提取器 (V3+: 寬容搜尋版)
-    修正：解決 Column 0 空白導致標題抓不到的問題
+    🔥 B計畫：暴力純文字提取
+    當 Azure 沒抓到表格時，直接掃描全文抓取「編號:數值」的模式。
     """
+    import re
     extracted_items = []
     
-    # 小幫手維持不變...
-    def extract_pc_target(title):
-        match = re.search(r"[\(\（]\s*(\d+)\s*(PC|SET|EA|UNIT|組|件|式|台|顆)", title, re.IGNORECASE)
-        if match: return int(match.group(1))
-        return 0
+    if not full_text: return []
 
-    def extract_batch_qty(title, spec):
-        keywords = ["熱處理", "研磨", "動平衡", "Heat", "Grind"]
-        if any(k in title for k in keywords):
-            match = re.search(r"(\d+)\s*(KG|M|G)", spec, re.IGNORECASE)
-            if match: return int(match.group(1))
-        return 0
-
-    # 狀態恢復
-    if pending_item:
-        current_title = pending_item.get('title')
-        current_spec = pending_item.get('spec')
-        current_measurements = pending_item.get('measurements', [])
-        state = 'OVERFLOW' 
-    else:
-        current_title = None
-        current_spec = None
-        current_measurements = []
-        state = 'EXPECT_TITLE'
-
-    # --- 掃描開始 ---
-    # 這裡我們不預設 start_row_idx，而是動態判斷
+    # 1. 切割出明細區塊 (避免抓到上面的總表)
+    # 我們假設 "規範" 或 "尺寸" 以下才是明細
+    start_keywords = ["規範", "規格", "尺寸", "檢驗紀錄", "ITEM", "SPEC"]
+    start_idx = -1
+    for k in start_keywords:
+        idx = full_text.find(k)
+        if idx != -1:
+            if start_idx == -1 or idx < start_idx: start_idx = idx
     
-    for row_idx, row in enumerate(azure_table_rows):
-        row_data = {}
-        max_col_idx = 0
+    # 如果找不到關鍵字，就從全長 1/3 處開始掃 (假設總表在上方)
+    target_text = full_text[start_idx:] if start_idx != -1 else full_text[len(full_text)//3:]
+    
+    # 2. 尋找數據聚落
+    # 邏輯：明細資料通常長這樣 "1:10.05", "2: 10.03"
+    # 我們先把所有像是 "數字:數字" 的東西抓出來
+    # 格式： (ID) (分隔符) (數值)
+    # 例如： 1 : 10.00 | 1:10.00 | 1 :10.00
+    pattern_data = re.compile(r"(\d+)\s*[:：]\s*([-+]?\d+\.?\d*|OK|N/A|M\d+|\[!\])")
+    
+    # 3. 尋找標題與規格 (這是最難的，因為純文字沒有格子)
+    # 策略：我們假設「數據聚落」的前面一段文字，通常就是標題
+    
+    # 先把文字按行切開
+    lines = target_text.split('\n')
+    
+    current_title = "未命名項目"
+    current_spec = ""
+    current_measurements = []
+    
+    # 簡單的狀態機
+    for line in lines:
+        line = line.strip()
+        if not line: continue
         
-        # 1. 建立該行的資料地圖
-        for cell in row.cells:
-            txt = cell.content.strip()
-            row_data[cell.column_index] = txt
-            if cell.column_index > max_col_idx: max_col_idx = cell.column_index
-
-        # 2. 抓取標題候選人 (Column 0 優先，若是空的找 Column 1)
-        # 這樣就算 Azure 把它歪到第二格，我們也能抓到
-        col0_text = row_data.get(0, "")
-        if not col0_text and row_data.get(1, "") and not row_data.get(2, ""):
-             # 如果第0格空，第1格有字，且第2格空(代表不是數據行) -> 假設第1格是標題
-             col0_text = row_data.get(1, "")
-
-        # 3. 判斷是否為表頭 (如果是"規範"、"尺寸"這行，就跳過)
-        all_text = "".join(row_data.values())
-        if "規範" in all_text and "尺寸" in all_text:
-            continue
-
-        # --- 狀態機邏輯 ---
-        if state == 'EXPECT_TITLE':
-            if col0_text:
-                current_title = col0_text
-                current_spec = "" 
-                state = 'EXPECT_SPEC'
-
-        elif state == 'EXPECT_SPEC':
-            # 規格通常在 title 的下一行 (同樣位置)
-            # 但有時候規格會跟 title 在同一行 (OCR 誤判合併)
-            # 這裡我們簡單處理：只要有 title，下一行有字就當規格
-            current_spec = col0_text
-            state = 'OVERFLOW' 
-
-        elif state == 'OVERFLOW':
-            if col0_text:
-                # 遇到新標題 -> 結算上一個
-                if current_title:
-                    extracted_items.append({
-                        "item_title": current_title,
-                        "std_spec": current_spec,
-                        "ds": "|".join(current_measurements),
-                        "item_pc_target": extract_pc_target(current_title),
-                        "batch_total_qty": extract_batch_qty(current_title, current_spec)
-                    })
-                
-                # 開啟新的一輪
-                current_title = col0_text
-                current_spec = ""
-                current_measurements = [] 
-                state = 'EXPECT_SPEC'
-            else:
-                # 沒標題，代表還是在原本項目的範圍內 (可能是更多數據)
-                pass
+        # 掃描這一行有沒有數據
+        matches = pattern_data.findall(line)
         
-        # --- 數據收集 (修正：全行掃描) ---
-        # 你的數據格式：編號(ID) : 數值(Val)
-        # 我們直接掃描所有格子，尋找符合 "ID:Val" 格式的內容
-        # 這樣就不用管它是在第幾格了
-        for c_idx, txt in row_data.items():
-            # 排除掉標題欄 (col 0 or col 1)
-            if c_idx <= 1 and (txt == current_title or txt == current_spec):
-                continue
+        if matches:
+            # 這一行包含數據 (例如 "1:10.05 2:10.06")
+            for m in matches:
+                rid, val = m
+                current_measurements.append(f"{rid}:{val}")
+        else:
+            # 這一行沒有數據 -> 可能是標題或規格
+            # 過濾掉雜訊 (純數字、太短的字)
+            if len(line) < 2 or line.isdigit(): continue
+            if "規範" in line or "尺寸" in line: continue # 跳過表頭
             
-            # 簡單清洗
-            clean_txt = txt.replace("\n", "").replace(" ", "")
-            if ":" in clean_txt and len(clean_txt) > 2:
-                current_measurements.append(clean_txt)
+            # 如果累積了數據，先結算上一個項目
+            if current_measurements:
+                extracted_items.append({
+                    "page": page_num,
+                    "item_title": current_title,
+                    "std_spec": current_spec, # 純文字模式很難精準抓規格，先給空或上一個
+                    "ds": "|".join(current_measurements),
+                    "item_pc_target": 0,
+                    "batch_total_qty": 0,
+                    "category": None
+                })
+                current_measurements = []
+                current_spec = "" # 重置規格
+            
+            # 判定這是標題還是規格？
+            # 簡單規則：含 mm, ± 的通常是規格，否則當標題
+            if "mm" in line.lower() or "±" in line or "+" in line:
+                current_spec = line
+            else:
+                # 假設它是標題，但在把它當標題前，先檢查是不是垃圾字
+                if len(line) > 20 and not any(x in line for x in ["軸", "本體", "蓋", "套"]):
+                    pass # 可能是雜訊，暫時忽略
+                else:
+                    current_title = line
 
-    # --- 迴圈結束，處理最後一筆 ---
-    pending_state = {
-        'title': current_title,
-        'spec': current_spec,
-        'measurements': current_measurements
-    }
-    
-    return extracted_items, pending_state
+    # 迴圈結束，結算最後一筆
+    if current_measurements:
+        extracted_items.append({
+            "page": page_num,
+            "item_title": current_title,
+            "std_spec": current_spec,
+            "ds": "|".join(current_measurements),
+            "item_pc_target": 0,
+            "batch_total_qty": 0,
+            "category": None
+        })
+        
+    return extracted_items
 
 def agent_unified_check(combined_input, full_text_for_search, api_key, model_name):
     import google.generativeai as genai
@@ -2321,9 +2303,9 @@ if st.session_state.photo_gallery:
             ocr_duration = time.time() - ocr_start
 
             # ==========================================
-            # 🐍 2. Python 全面提取 (明細 + 總表)
+            # 🐍 2. Python 全面提取 (明細 + 總表) - 雙重保障版
             # ==========================================
-            status_box.write("⚡ 正在執行 Python 結構化提取 (跳過 AI)...")
+            status_box.write("⚡ 正在執行 Python 結構化提取 (啟動雙重保障機制)...")
             py_extract_start = time.time()
             
             res_main = {
@@ -2337,77 +2319,158 @@ if st.session_state.photo_gallery:
             all_dim_data = []
             final_header_info = {}
             
-            # 跨頁狀態傳遞器 (這是解決跨頁斷掉的關鍵)
+            # 跨頁狀態傳遞器
             pending_detail_item = None 
+
+            # --- 定義 B 計畫函式 (放在這裡確保執行得到) ---
+            def python_extract_detail_from_raw_text(full_text, page_num):
+                import re
+                extracted = []
+                if not full_text: return []
+
+                # 1. 定位明細起始點
+                start_keywords = ["規範", "規格", "尺寸", "檢驗紀錄", "ITEM", "SPEC", "規 範"]
+                start_idx = -1
+                for k in start_keywords:
+                    idx = full_text.find(k)
+                    if idx != -1:
+                        if start_idx == -1 or idx < start_idx: start_idx = idx
+                
+                target_text = full_text[start_idx:] if start_idx != -1 else full_text[len(full_text)//3:]
+                
+                # 2. 數據抓取 (格式: 編號:數值)
+                lines = target_text.split('\n')
+                curr_title = "未命名項目(B計畫)"
+                curr_spec = ""
+                curr_meas = []
+                
+                # 簡單過濾雜訊用的 Regex
+                pattern_data = re.compile(r"(\d+)\s*[:：]\s*([-+]?\d+\.?\d*|OK|N/A|M\d+|\[!\])")
+
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue
+                    
+                    matches = pattern_data.findall(line)
+                    if matches:
+                        # 這一行是數據
+                        for m in matches:
+                            curr_meas.append(f"{m[0]}:{m[1]}")
+                    else:
+                        # 這一行可能是標題或規格
+                        if len(line) < 2 or line.isdigit(): continue
+                        if "規範" in line or "尺寸" in line or "檢驗" in line: continue
+                        
+                        # 如果已經有累積數據，先結算上一筆
+                        if curr_meas:
+                            extracted.append({
+                                "page": page_num,
+                                "item_title": curr_title,
+                                "std_spec": curr_spec,
+                                "ds": "|".join(curr_meas),
+                                "item_pc_target": 0, # B計畫很難抓這些，先給0
+                                "batch_total_qty": 0,
+                                "category": None
+                            })
+                            curr_meas = []
+                            curr_spec = ""
+                        
+                        # 判定標題/規格
+                        if "mm" in line.lower() or "±" in line or "+" in line:
+                            curr_spec = line
+                        else:
+                            # 簡單防雜訊
+                            if len(line) > 30 and " " in line: pass 
+                            else: curr_title = line
+                
+                # 結算最後一筆
+                if curr_meas:
+                    extracted.append({
+                        "page": page_num,
+                        "item_title": curr_title,
+                        "std_spec": curr_spec,
+                        "ds": "|".join(curr_meas),
+                        "item_pc_target": 0,
+                        "batch_total_qty": 0,
+                        "category": None
+                    })
+                return extracted
+            # ---------------------------------------------
             
             # 遍歷每一頁
             for i, p in enumerate(st.session_state.photo_gallery):
                 page_num = i + 1
                 azure_result = p.get('azure_result')
                 
+                has_extracted_detail = False # 🚩 標記：這頁有沒有抓到明細？
+
                 # --- A. Azure 表格模式 (首選) ---
                 if azure_result and hasattr(azure_result, 'tables'):
                     print(f"📄 Page {page_num}: Azure 發現 {len(azure_result.tables)} 個表格")
                     
                     for t_idx, table in enumerate(azure_result.tables):
-                        # 簡單判斷：把表頭文字串起來檢查
+                        # 簡單判斷
                         header_txt = ""
                         if len(table.rows) > 0:
                             header_txt = "".join([c.content for c in table.rows[0].cells])
                         
-                        # --- 修改點 1: 總表判斷 (嚴格判定) ---
+                        # 判斷總表
                         is_summary = False
-                        # 判斷特徵：申請+數量 或 實交+數量 或 工令+名稱
                         if ("申請" in header_txt and "數量" in header_txt) or \
                            ("實交" in header_txt and "數量" in header_txt) or \
                            ("工令" in header_txt and "名稱" in header_txt):
                             is_summary = True
                         
                         if is_summary:
-                            # 這是【總表】
-                            print(f"   -> [Table {t_idx+1}] 偵測到總表結構")
+                            print(f"   -> [Table {t_idx+1}] 偵測到總表")
                             _, s_rows = python_extract_summary_strict(azure_result)
                             if s_rows: all_summary_rows.extend(s_rows)
                         
                         else:
-                            # --- 修改點 2: 使用 else 捕捉所有非總表的表格 (明細表) ---
-                            # 這樣即使表格第一行沒有標題 (直接是數據)，也會進入提取流程
-                            print(f"   -> [Table {t_idx+1}] 判定為明細表 (Row0: {header_txt[:10]}...)")
+                            # 只要不是總表，就當明細表處理
+                            print(f"   -> [Table {t_idx+1}] 嘗試提取明細 (Row0: {header_txt[:10]}...)")
                             
-                            # 呼叫 V3 寬容版提取函式 (請確保下方有更新此函式)
+                            # 呼叫 V2 (請確保你有更新 V2 函式)
                             d_rows, next_pending = python_extract_detail_table_v2(table.rows, pending_detail_item)
                             
-                            # 補上頁碼
                             for d in d_rows: d['page'] = page_num
-                            
+                                
                             if d_rows:
-                                print(f"      ✅ 成功抓到 {len(d_rows)} 筆數據")
                                 all_dim_data.extend(d_rows)
-                            else:
-                                print(f"      ⚠️ 雖然進入提取，但未抓到有效數據 (可能是雜訊或欄位對不上)")
+                                has_extracted_detail = True # 成功抓到！
+                                print(f"      ✅ Azure 表格提取成功: {len(d_rows)} 筆")
                             
-                            # 更新待續狀態
                             pending_detail_item = next_pending
                             
-                    # 順便抓表頭資訊 (工令/日期)
+                    # 抓表頭資訊
                     h_info, _ = python_extract_summary_text_fallback([p])
                     if h_info.get("job_no"): final_header_info["job_no"] = h_info["job_no"]
                     if h_info.get("scheduled_date"): 
                         final_header_info["scheduled_date"] = h_info["scheduled_date"]
                         final_header_info["actual_date"] = h_info["actual_date"]
 
-
-                # --- B. 純文字備援 (如果 Azure 沒抓到表格) ---
-                else:
-                    print(f"📄 Page {page_num}: 進入純文字模式")
-                    h_info, s_rows = python_extract_summary_text_fallback([p])
-                    if s_rows: all_summary_rows.extend(s_rows)
-                    if h_info: final_header_info.update(h_info)
+                # --- B. 純文字暴力模式 (如果 Azure 表格失效) ---
+                if not has_extracted_detail:
+                    print(f"⚠️ Page {page_num}: Azure 表格模式失效，啟動 B 計畫 (Regex)...")
+                    
+                    full_txt = p.get('full_text', '')
+                    # 如果 full_text 是空的，試著從 azure_result 拿
+                    if not full_txt and azure_result:
+                         full_txt = azure_result.content
+                    
+                    # 呼叫上面定義的 B 計畫函式
+                    raw_items = python_extract_detail_from_raw_text(full_txt, page_num)
+                    
+                    if raw_items:
+                        print(f"   🎉 B 計畫成功！抓到 {len(raw_items)} 筆項目")
+                        all_dim_data.extend(raw_items)
+                    else:
+                        print(f"   ❌ B 計畫也未發現數據。")
             
-            # 迴圈結束後，如果還有 pending 的項目 (最後一項)，記得存進去
+            # 迴圈結束後，存入最後一筆 pending
             if pending_detail_item and pending_detail_item['title']:
                 all_dim_data.append({
-                    "page": len(st.session_state.photo_gallery), # 算在最後一頁
+                    "page": len(st.session_state.photo_gallery),
                     "item_title": pending_detail_item['title'],
                     "std_spec": pending_detail_item['spec'],
                     "ds": "|".join(pending_detail_item['measurements']),
@@ -2421,7 +2484,7 @@ if st.session_state.photo_gallery:
             res_main["summary_rows"] = all_summary_rows
             res_main["dimension_data"] = all_dim_data
             
-            # 欄位預設值補全
+            # 欄位補全
             for item in res_main["dimension_data"]:
                 if "item_pc_target" not in item: item["item_pc_target"] = 0
                 if "batch_total_qty" not in item: item["batch_total_qty"] = 0
