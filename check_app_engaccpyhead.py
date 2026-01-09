@@ -287,6 +287,104 @@ def extract_layout_with_azure(file_obj, endpoint, key):
 
     return markdown_output, header_snippet, final_full_text, None, real_page_num
     
+def python_extract_summary_strict(azure_result):
+    """
+    Python 硬提取引擎：專門處理總表 (Summary Table) 與 表頭資訊
+    優點：100% 準確抓取 Azure 辨識到的表格欄位，不會有 AI 幻覺。
+    """
+    import re
+    
+    # 1. 初始化容器
+    header_info = {
+        "job_no": "",
+        "scheduled_date": "", 
+        "actual_date": ""
+    }
+    summary_rows = []
+    
+    if not azure_result:
+        return header_info, summary_rows
+
+    # -------------------------------------------------------
+    # A. 提取表頭資訊 (工令) - 使用 Regex 掃描全文
+    # -------------------------------------------------------
+    full_text = azure_result.content
+    
+    # 抓工令 (W/R/O/Y 開頭 + 數字)
+    # 針對圖片中的 "工令編號:W363Z85422"
+    job_match = re.search(r"工令編號[:：\s]*([WROY]\w+)", full_text, re.IGNORECASE)
+    if job_match:
+        header_info["job_no"] = job_match.group(1).strip()
+
+    # -------------------------------------------------------
+    # B. 提取總表數據 (直接遍歷 Azure Table)
+    # -------------------------------------------------------
+    # 我們假設總表通常是第一個表格，且包含關鍵字 "申請數量" 或 "實交數量"
+    target_table = None
+    
+    for table in azure_result.tables:
+        # 把這個表格的所有內容拼起來檢查有沒有關鍵字
+        table_content = "".join([cell.content for cell in table.cells])
+        if "申請數量" in table_content and "實交數量" in table_content:
+            target_table = table
+            break
+            
+    if target_table:
+        # 將 Azure 的 Cell 轉為以 Row 為單位的字典: rows[row_index][col_index] = content
+        rows = {}
+        for cell in target_table.cells:
+            r = cell.row_index
+            c = cell.column_index
+            if r not in rows: rows[r] = {}
+            rows[r][c] = cell.content.replace("\n", "").strip()
+            
+        # 開始解析每一行
+        # 根據您的圖片：
+        # Col 0: 項次 (1, 2, 3...)
+        # Col 1: 名稱及規範
+        # Col 2: 單位
+        # Col 3: 申請數量
+        # Col 4: 實交數量
+        # Col 5: 存放位置
+        # Col 6: 預定 (完成交貨日期下)
+        # Col 7: 實際 (完成交貨日期下)
+        
+        for r_idx in sorted(rows.keys()):
+            row_data = rows[r_idx]
+            
+            # 檢核點：第一欄必須是數字 (項次)，這樣可以避開標題列
+            idx_val = row_data.get(0, "")
+            if not idx_val.isdigit():
+                continue
+                
+            # 提取數據
+            item = {
+                "page": 1, # 預設當前頁
+                "index": idx_val,
+                "title": row_data.get(1, ""),      # 名稱
+                "apply_qty": row_data.get(3, "0"), # 申請數量
+                "delivery_qty": row_data.get(4, "0"), # 實交數量
+                "sched_date": row_data.get(6, ""), # 預定日期
+                "actual_date": row_data.get(7, "") # 實際日期
+            }
+            
+            # 數值清洗 (轉為 int)
+            try:
+                item["apply_qty"] = int(re.sub(r"\D", "", str(item["apply_qty"])))
+            except: item["apply_qty"] = 0
+            
+            try:
+                item["delivery_qty"] = int(re.sub(r"\D", "", str(item["delivery_qty"])))
+            except: item["delivery_qty"] = 0
+            
+            summary_rows.append(item)
+            
+            # 順便抓一下日期填回 Header Info (通常每一行日期都一樣，抓最後一行的就好)
+            if item["sched_date"]: header_info["scheduled_date"] = item["sched_date"]
+            if item["actual_date"]: header_info["actual_date"] = item["actual_date"]
+
+    return header_info, summary_rows
+    
 def agent_unified_check(combined_input, full_text_for_search, api_key, model_name):
     import google.generativeai as genai
     import json
@@ -299,29 +397,38 @@ def agent_unified_check(combined_input, full_text_for_search, api_key, model_nam
     except:
         dynamic_rules = ""
 
-    # 2. 定義 Prompt
+    # 2. 定義 Prompt (Python 協作版 - AI 專注於明細)
     base_prompt = """
-    角色：嚴格的數據抄錄程式。針對單頁輸入，依據 {{RULES_PLACEHOLDER}} 執行 JSON 填空。
+    角色：專業的工程數據提取程式。
+    任務：忽略上半部總表，僅針對下半部 [明細規格表] 進行深度解析與抄錄。
     
-    ### 1. 明細表數據 (來源: === [DETAIL_TABLE] ===)
-    - **item_title**: 完整抄錄，嚴禁遺漏「未再生、銲補、車修、軸頸」等關鍵字。
+    ### ⚠️ 邊界指令
+    1. **忽略總表**：上半部的「申請數量、實交數量、預定/實際日期」由外部程式處理，JSON 中請回傳空值即可。
+    2. **專注明細**：全神貫注於下半部的規格敘述與實測數據。
+    
+    ### 1. 明細表數據 (來源: 下半部 === [DETAIL_TABLE] ===)
+    - **item_title**: 完整抄錄規格欄左側的標題，嚴禁遺漏「未再生、銲補、車修、軸頸」等關鍵字。
     - **std_spec**: 抄錄含 `mm, ±, +, -` 的規格文字。
     - **item_pc_target**: 提取標題最後一個括號內數字 (如 `(4SET)`->`4`), 無則 `0`。
-    - **batch_total_qty**: 若標題含「熱處理、研磨、動平衡」，提取首欄總量 (如 `2425KG`)，否則 `    - **ds**: 格式 `ID:數值|ID:數值`。
-      - **規則**: 保留尾數0 (如 `349.90`)。
-      - **雜訊**: 若塗改/模糊/看不清，數值填 `[!]` (如 `V1:[!]`)，**嚴禁猜測**。
+    
+    - **batch_total_qty**: (預設為 `0`)
+      - **觸發條件**: **僅當** item_title 包含「熱處理」、「研磨」、「動平衡」時，才允許搜尋該行文字敘述中的總量 (如 `2425KG`, `1200`, `1 SET`)。
+      - **禁令**: 若標題**不含**上述關鍵字，**一律填 `0`**。
+      
+    - **ds**: 格式 `ID:內容|ID:內容`。
+      - **規則**: 完整抄錄實測欄位，包含數字、文字(如 `M10`, `OK`) 或 `N/A`。
+      - **雜訊**: 僅在塗改/模糊/看不清時，填 `[!]` (如 `V1:[!]`)，**嚴禁猜測**。
+      
     - **category**: 固定回傳 `null`。
     
-    ### 2. 總表數據 (來源: === [SUMMARY_TABLE] ===)
-    - **summary_rows**: 提取 `title`, `apply_qty`(申請), `delivery_qty`(實交), `page`(當前頁碼)。
-    - **header_info**:
-      - `job_no`: W/R/O/Y 開頭工令。
-      - `scheduled_date` / `actual_date`: 格式 `YYYY/MM/DD`。
+    ### 2. 總表數據 (Python 已接管，AI 請留空)
+    - **summary_rows**: 回傳空陣列 `[]`。
+    - **header_info**: 回傳空物件 `{}`。
     
     ### 3. 輸出格式 (JSON Only)
     {
-      "header_info": { "job_no": "...", "scheduled_date": "...", "actual_date": "..." },
-      "summary_rows": [ { "page": 1, "title": "...", "apply_qty": 0, "delivery_qty": 0 } ],
+      "header_info": {}, 
+      "summary_rows": [], 
       "dimension_data": [
          {
            "page": 1, 
