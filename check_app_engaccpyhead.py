@@ -2044,33 +2044,38 @@ if st.session_state.photo_gallery:
             ai_duration = time.time() - ai_start_time
             
             # -----------------------------------------------------------
-            # ✂️ [新增功能] 移花接木手術：用 Python 強制覆蓋總表數據
+            # ✂️ [新增功能] 移花接木手術：用 Python 強制覆蓋總表數據 (實戰版)
             # -----------------------------------------------------------
-            # 確保我們有 Azure 的原始結果 (all_pages 裡面存有原始資訊嗎？)
-            # 注意：這裡我們需要 Azure 原始物件。
-            # 由於您的架構是並行處理，Azure 的原始 result 物件可能沒有被完整保留在 res_main。
-            # 但我們可以針對第一頁 (通常總表在第一頁) 重新抓取或從 session_state 找。
-            
-            # 💡 修正策略：因為您的架構是把每一頁的文字存下來，沒有留 Azure Result 物件。
-            # 如果要實現這個功能，您需要在 OCR 階段把 Azure Result 暫存起來，或者在這裡針對第一頁重跑一次 Table Extract。
-            
-            # 假設您的 OCR 階段有保留 Azure Result (建議修改 OCR 區塊回傳 result 物件)
-            # 如果沒有，這裡示範如何 "針對第一頁" 快速重抓 (不耗 Token，只耗 Azure 運算)
             try:
+                # 1. 檢查是否有第一頁的 Azure 原始「地圖」(azure_result)
                 if st.session_state.photo_gallery:
-                    first_page_item = st.session_state.photo_gallery[0]
-                    # 這裡假設您有辦法拿到 Azure 的原始物件，若無，您可能需要修改 OCR 區塊
-                    # 或者，如果您在 OCR 階段有把 result 存進 session_state，就可以拿來用。
-                    pass 
-            except:
-                pass
-            
-            # ⚠️ 重要提示：
-            # 您的程式碼目前只有存 'full_text'，沒有存 Azure 的 'result' 物件。
-            # 要啟用「Python 總表提取」，您必須在上面的 OCR 階段 (第 155 行附近)
-            # 把 Azure 回傳的 result 物件也存進 st.session_state.photo_gallery 裡。
-            # -----------------------------------------------------------
+                    first_page_data = st.session_state.photo_gallery[0].get('azure_result')
+                    
+                    if first_page_data:
+                        # 2. 執行 Python 硬提取 (呼叫我們之前寫好的新工具)
+                        py_header, py_summary = python_extract_summary_strict(first_page_data)
+                        
+                        # 3. 如果 Python 抓到工令，強行覆蓋 AI 的結果
+                        if py_header.get("job_no"):
+                            # 確保 header_info 容器存在
+                            if "header_info" not in res_main: res_main["header_info"] = {}
+                            res_main["header_info"]["job_no"] = py_header["job_no"]
+                        
+                        # 4. 如果 Python 抓到日期，強行覆蓋 AI 的結果
+                        if py_header.get("scheduled_date"):
+                            res_main["header_info"]["scheduled_date"] = py_header["scheduled_date"]
+                            res_main["header_info"]["actual_date"] = py_header["actual_date"]
 
+                        # 5. 如果 Python 抓到總表表格，直接整張換掉
+                        if py_summary:
+                            res_main["summary_rows"] = py_summary
+                            # 在後台印出成功訊息，方便除錯
+                            print(f"✅ [移花接木成功] 已使用 Python 硬提取覆蓋總表，共 {len(py_summary)} 筆數據")
+                    else:
+                        print("⚠️ [移花接木跳過] 第一頁找不到 azure_result (地圖缺失)")
+            except Exception as e:
+                print(f"❌ [移花接木失敗] 錯誤原因: {e}")
+            # -----------------------------------------------------------
             
             # ========================================================
             # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
