@@ -2345,54 +2345,54 @@ if st.session_state.photo_gallery:
                 page_num = i + 1
                 azure_result = p.get('azure_result')
                 
-                # --- A. Azure 表格模式 (首選) ---
-                if azure_result and hasattr(azure_result, 'tables'):
-                    print(f"📄 Page {page_num}: 發現 {len(azure_result.tables)} 個表格")
-                    
-                    for table in azure_result.tables:
-                        # 簡單判斷：把表頭文字串起來檢查
-                        header_txt = ""
-                        if len(table.rows) > 0:
-                            header_txt = "".join([c.content for c in table.rows[0].cells])
+                    # --- A. Azure 表格模式 (首選) ---
+                    if azure_result and hasattr(azure_result, 'tables'):
+                        print(f"📄 Page {page_num}: 發現 {len(azure_result.tables)} 個表格")
                         
-                        # --- 修改點 1: 總表判斷稍微加強 (避免誤判) ---
-                        # 判斷是否為「總表」：通常會有 申請/實交 加上 數量
-                        is_summary = False
-                        if ("申請" in header_txt and "數量" in header_txt) or \
-                           ("實交" in header_txt and "數量" in header_txt) or \
-                           ("工令" in header_txt and "名稱" in header_txt):
-                            is_summary = True
-                        
-                        if is_summary:
-                            # 這是【總表】
-                            print(f"   -> [總表] 偵測到總表結構")
-                            _, s_rows = python_extract_summary_strict(azure_result)
-                            if s_rows: all_summary_rows.extend(s_rows)
-                        
-                        else:
-                            # --- 修改點 2: 將 elif 改為 else (捕捉漏網之魚) ---
-                            # 只要「不是總表」，我們就假設它是【明細表】
-                            # 這樣即使表格第一行是數據 (沒有"規範/尺寸"表頭)，也會進去抓
-                            print(f"   -> [明細] 嘗試提取數據 (Row 0: {header_txt[:15]}...)")
+                        for table in azure_result.tables:
+                            # 簡單判斷：把表頭文字串起來檢查
+                            header_txt = ""
+                            if len(table.rows) > 0:
+                                header_txt = "".join([c.content for c in table.rows[0].cells])
                             
-                            # 呼叫新寫的 V2 函式
-                            d_rows, next_pending = python_extract_detail_table_v2(table.rows, pending_detail_item)
+                            # --- 修改點 1: 總表判斷稍微加強 (避免誤判) ---
+                            # 判斷是否為「總表」：通常會有 申請/實交 加上 數量
+                            is_summary = False
+                            if ("申請" in header_txt and "數量" in header_txt) or \
+                               ("實交" in header_txt and "數量" in header_txt) or \
+                               ("工令" in header_txt and "名稱" in header_txt):
+                                is_summary = True
                             
-                            # 補上頁碼
-                            for d in d_rows: d['page'] = page_num
+                            if is_summary:
+                                # 這是【總表】
+                                print(f"   -> [總表] 偵測到總表結構")
+                                _, s_rows = python_extract_summary_strict(azure_result)
+                                if s_rows: all_summary_rows.extend(s_rows)
+                            
+                            else:
+                                # --- 修改點 2: 將 elif 改為 else (捕捉漏網之魚) ---
+                                # 只要「不是總表」，我們就假設它是【明細表】
+                                # 這樣即使表格第一行是數據 (沒有"規範/尺寸"表頭)，也會進去抓
+                                print(f"   -> [明細] 嘗試提取數據 (Row 0: {header_txt[:15]}...)")
                                 
-                            all_dim_data.extend(d_rows)
-                            
-                            # 更新待續狀態
-                            pending_detail_item = next_pending
-                            print(f"      抓到明細: {len(d_rows)} 筆")
-                            
-                    # 順便抓表頭資訊 (工令/日期) - 用 Regex V9 掃一下最穩
-                    h_info, _ = python_extract_summary_text_fallback([p])
-                    if h_info.get("job_no"): final_header_info["job_no"] = h_info["job_no"]
-                    if h_info.get("scheduled_date"): 
-                        final_header_info["scheduled_date"] = h_info["scheduled_date"]
-                        final_header_info["actual_date"] = h_info["actual_date"]
+                                # 呼叫新寫的 V2 函式
+                                d_rows, next_pending = python_extract_detail_table_v2(table.rows, pending_detail_item)
+                                
+                                # 補上頁碼
+                                for d in d_rows: d['page'] = page_num
+                                    
+                                all_dim_data.extend(d_rows)
+                                
+                                # 更新待續狀態
+                                pending_detail_item = next_pending
+                                print(f"      抓到明細: {len(d_rows)} 筆")
+                                
+                        # 順便抓表頭資訊 (工令/日期) - 用 Regex V9 掃一下最穩
+                        h_info, _ = python_extract_summary_text_fallback([p])
+                        if h_info.get("job_no"): final_header_info["job_no"] = h_info["job_no"]
+                        if h_info.get("scheduled_date"): 
+                            final_header_info["scheduled_date"] = h_info["scheduled_date"]
+                            final_header_info["actual_date"] = h_info["actual_date"]
 
                 # --- B. 純文字備援 (如果 Azure 沒抓到表格) ---
                 else:
