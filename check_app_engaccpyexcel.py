@@ -1601,31 +1601,30 @@ def clean_job_no_list(job_list):
     
 def python_header_audit_batch(photo_gallery, ai_res_json):
     """
-    Python 表頭稽核官 (Batch 架構適配版 v31: 整合工令淨化)
+    Python 表頭稽核官 (Batch 架構適配版 v32: 整合工令淨化 + 日期一致性檢查)
     """
     header_issues = []
     import re
     from datetime import datetime
 
     # --- 1. 混單檢查 (利用 OCR 原始文字) ---
-    # 策略：直接用 Regex 在每一頁的文字裡撈 W/R/O/Y 開頭的字串
     job_pattern = r"([WROY][A-Z0-9]{9})" # 抓 10 碼
-    found_jobs_map = {} # { "工令號": [頁碼list] }
+    found_jobs_map = {} 
 
     for idx, item in enumerate(photo_gallery):
         txt = item.get('full_text', '').upper().replace(" ", "").replace("-", "")
-        # 尋找所有疑似工令的字串
         matches = re.findall(job_pattern, txt)
         
-        # 🔥🔥🔥 [關鍵修改] 呼叫淨化函式過濾雜訊 🔥🔥🔥
-        valid_matches = clean_job_no_list(matches)
-        
-        # 只把「淨化後」的工令加入清單
+        # 呼叫外部定義的淨化函式 (如果您的程式環境裡有定義的話)
+        if 'clean_job_no_list' in globals():
+            valid_matches = clean_job_no_list(matches)
+        else:
+            valid_matches = matches # fallback
+
         for job in valid_matches:
             if job not in found_jobs_map: found_jobs_map[job] = []
             found_jobs_map[job].append(idx + 1)
 
-    # 如果找到多種不同的工令 -> 報警
     if len(found_jobs_map) > 1:
         details = [f"{k} (P.{v})" for k, v in found_jobs_map.items()]
         header_issues.append({
@@ -1635,10 +1634,39 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(OCR)"
         })
 
-    # --- 2. 格式與日期檢查 (利用 AI JSON) ---
+    # --- 2. 日期一致性檢查 (新增邏輯 🔥) ---
+    # 從 summary_rows 抓取每一行的日期，而不只是看 header_info 的第一筆
+    summary_rows = ai_res_json.get("summary_rows", [])
+    
+    # A. 預定交貨日期 (Scheduled Date)
+    # 過濾掉空值，只看有寫日期的
+    all_sch_dates = [r.get('scheduled_date').strip() for r in summary_rows if r.get('scheduled_date')]
+    unique_sch = set(all_sch_dates)
+    
+    if len(unique_sch) > 1:
+        header_issues.append({
+            "page": "全卷", "item": "預定日期", "issue_type": "📅 日期不一致",
+            "common_reason": f"偵測到多個不同的預定交貨日：{', '.join(unique_sch)}",
+            "failures": [{"id": "發現日期", "val": str(list(unique_sch))}],
+            "source": "🐍 表頭稽核(Python)"
+        })
+
+    # B. 實際交貨日期 (Actual Date)
+    all_act_dates = [r.get('actual_date').strip() for r in summary_rows if r.get('actual_date')]
+    unique_act = set(all_act_dates)
+    
+    if len(unique_act) > 1:
+        header_issues.append({
+            "page": "全卷", "item": "實交日期", "issue_type": "📅 日期不一致",
+            "common_reason": f"偵測到多個不同的實際交貨日：{', '.join(unique_act)}",
+            "failures": [{"id": "發現日期", "val": str(list(unique_act))}],
+            "source": "🐍 表頭稽核(Python)"
+        })
+
+    # --- 3. 格式與日期邏輯 (利用 Header Info 做主要判定) ---
     h_info = ai_res_json.get("header_info", {})
     
-    # 工令格式 (針對 AI 最終認定的那一組)
+    # 工令格式檢查
     ai_job = h_info.get("job_no", "Unknown")
     if ai_job and ai_job != "Unknown":
         clean_job = ai_job.upper().replace(" ", "").replace("-", "")
@@ -1650,15 +1678,18 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
                 "source": "🐍 表頭稽核(AI)"
             })
 
-    # 日期邏輯 (實際 <= 預定)
+    # 逾期檢查 (這裡還是拿 header_info 裡的主日期來比對，通常是第一筆)
     d_sch = h_info.get("scheduled_date", "Unknown")
     d_act = h_info.get("actual_date", "Unknown")
     
     if d_sch != "Unknown" and d_act != "Unknown":
         try:
-            # 嘗試解析 YYYY/MM/DD
-            dt_sch = datetime.strptime(d_sch.replace("-", "/"), "%Y/%m/%d")
-            dt_act = datetime.strptime(d_act.replace("-", "/"), "%Y/%m/%d")
+            # 支援 Excel 可能產生的不同分隔符
+            d_sch_clean = d_sch.replace("-", "/").replace(".", "/")
+            d_act_clean = d_act.replace("-", "/").replace(".", "/")
+            
+            dt_sch = datetime.strptime(d_sch_clean, "%Y/%m/%d")
+            dt_act = datetime.strptime(d_act_clean, "%Y/%m/%d")
             
             if dt_act > dt_sch:
                  header_issues.append({
@@ -1668,7 +1699,7 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
                     "source": "🐍 表頭稽核(AI)"
                 })
         except:
-            pass # 日期格式讀不懂，跳過
+            pass 
 
     return header_issues
     
