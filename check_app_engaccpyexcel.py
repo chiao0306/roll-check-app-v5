@@ -1349,27 +1349,31 @@ def python_accounting_audit(dimension_data, res_main):
     
 def python_process_audit(dimension_data):
     """
-    Python 流程引擎 (v72.2: 最終完整版)
+    Python 流程引擎 (v73: 防彈背心版)
     邏輯更新：
-    1. [軸頸專屬]: 連坐法 (查本體) + 全餐制 (1,2,3缺一不可)。
-    2. [一般通用]: 
-       - 基礎溯源: 不可跳關 (有3就要有1,2)。
-       - 🔥新增規則: 有銲補(2) 則必須有 再生(3)。(允許只做1，但若做了2就一定要做完3)。
+    1. [核心防護]: 加入 safe_str 強制清洗 NaN/None，避免邏輯誤判。
+    2. [軸頸專屬]: 連坐法 (查本體) + 全餐制 (1,2,3缺一不可)。
+    3. [一般通用]: 基礎溯源 + 銲補再生規則。
     """
     process_issues = []
     import re
     import pandas as pd
     from thefuzz import fuzz
 
-    # 1. 讀取全域門檻
     CURRENT_THRESHOLD = globals().get('GLOBAL_FUZZ_THRESHOLD', 95)
 
-    # 輔助函式
+    # 🔥 [新增] 防彈衣小幫手
+    def safe_str(val):
+        if val is None: return ""
+        s = str(val).strip()
+        if s.lower() in ['nan', 'none', 'null']: return ""
+        return s
+
     def remove_tail_info(text):
-        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", str(text)).strip()
+        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", safe_str(text)).strip()
 
     def clean_text(text):
-        t = str(text).upper() 
+        t = safe_str(text).upper() 
         t = t.replace("（", "(").replace("）", ")")
         t = t.replace("＝", "=").replace("＋", "+").replace("－", "-")
         t = t.replace("×", "X").replace("＊", "X") 
@@ -1382,14 +1386,12 @@ def python_process_audit(dimension_data):
         df = pd.read_excel("rules.xlsx")
         df.columns = [c.strip() for c in df.columns]
         for _, row in df.iterrows():
-            iname = str(row.get('Item_Name', '')).strip()
-            p_rule = str(row.get('Process_Rule', '')).strip()
-            if p_rule.lower() == 'nan': p_rule = ""
+            iname = safe_str(row.get('Item_Name'))
+            p_rule = safe_str(row.get('Process_Rule'))
             if iname:
                 rules_map[clean_text(iname)] = p_rule.upper()
     except: pass
 
-    # 定義製程階段
     STAGE_MAP = { 1: "未再生/粗車", 2: "銲補/焊補", 3: "再生/精車", 4: "研磨" }
     history = {} 
 
@@ -1397,13 +1399,16 @@ def python_process_audit(dimension_data):
 
     # --- 步驟 A: 資料收集 (Parsing) ---
     for item in dimension_data:
+        # 🔥 全面換上 safe_str
         p_num = item.get("page", "?")
-        title = str(item.get("item_title", "")).strip()
+        title = safe_str(item.get("item_title"))
+        ds = safe_str(item.get("ds"))
         
-        # 準備匹配 Key
+        # 標題為空就跳過，節省效能
+        if not title: continue
+
         title_no_tail = remove_tail_info(title)
         title_clean_rule = clean_text(title_no_tail)
-        ds = str(item.get("ds", ""))
         
         # 豁免
         title_full = clean_text(title)
@@ -1461,18 +1466,22 @@ def python_process_audit(dimension_data):
         
         if track == "Unknown" or stage == 0: continue 
 
-        # 數值提取
+        # 數值提取 (這裡也有防護)
+        if not ds: continue
         segments = ds.split("|")
         for seg in segments:
             parts = seg.split(":")
             if len(parts) < 2: continue
             
-            rid = parts[0].strip().upper().replace("×", "X").replace("*", "X").replace(" ", "")
-            val_str = parts[1].strip()
+            # safe_str 確保就算 split 出怪東西也能變空字串
+            rid = safe_str(parts[0]).upper().replace("×", "X").replace("*", "X").replace(" ", "")
+            val_str = safe_str(parts[1])
 
             nums = re.findall(r"\d+\.?\d*", val_str)
             if not nums: continue
-            val = float(nums[0])
+            try:
+                val = float(nums[0])
+            except: continue
             
             key = (rid, track)
             if key not in history: history[key] = {}
@@ -1480,7 +1489,7 @@ def python_process_audit(dimension_data):
                 "val": val, "page": p_num, "title": title
             }
 
-    # --- 步驟 B: 預先計算 (連坐法用) ---
+    # --- 步驟 B: 預先計算 ---
     body_unregen_ids = set()
     for (rid, track), stages_data in history.items():
         if track == "本體" and 1 in stages_data:
@@ -1495,7 +1504,6 @@ def python_process_audit(dimension_data):
 
         # 🔥 通道 1: 軸頸 VIP 專屬規則
         if track == "軸頸":
-            # 1.1 連坐法
             if 1 in stages_data:
                 if rid not in body_unregen_ids:
                     process_issues.append({
@@ -1507,7 +1515,6 @@ def python_process_audit(dimension_data):
                         "source": "🐍 流程引擎"
                     })
 
-            # 1.2 全餐制 (1,2,3 必備)
             required_set = {1, 2, 3}
             missing_set = required_set - set(stages_data.keys())
             
@@ -1522,9 +1529,8 @@ def python_process_audit(dimension_data):
                     "source": "🐍 流程引擎"
                 })
         
-        # 🔥 通道 2: 一般溯源 (本體或其他)
+        # 🔥 通道 2: 一般溯源
         else:
-            # 2.1 基礎防呆：不可跳關 (往回查)
             missing_stages = []
             for req_s in range(1, max_stage):
                 if req_s not in stages_data: missing_stages.append(STAGE_MAP[req_s])
@@ -1539,10 +1545,7 @@ def python_process_audit(dimension_data):
                     "source": "🐍 流程引擎"
                 })
 
-            # 🔥 2.2 [新增] 銲補後半程檢查：有 2 則必有 3
-            # 如果有做銲補 (Stage 2)，但沒有做再生 (Stage 3) -> 異常
             if 2 in stages_data and 3 not in stages_data:
-                # 找出銲補那一頁的資訊來報錯
                 weld_info = stages_data[2]
                 process_issues.append({
                     "page": weld_info['page'],
@@ -1573,7 +1576,6 @@ def python_process_audit(dimension_data):
                     sign = "<" if expect_a_smaller else ">"
                     process_issues.append({
                         "page": info_b['page'],
-                        # 🔥 修改：直接使用該項目的真實名稱，讓前台能配對亮燈
                         "item": info_b['title'], 
                         "issue_type": "🛑流程異常(尺寸倒置)",
                         "common_reason": f"尺寸邏輯錯誤：{STAGE_MAP[s_a]} 應 {sign} {STAGE_MAP[s_b]}",
