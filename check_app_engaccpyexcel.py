@@ -1777,7 +1777,7 @@ with st.container(border=True):
 
     # --- 情況 C: 上傳 Excel (最終完美版 v5：真實頁碼提取) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式」：已修正頁碼顯示，將從表頭提取真實頁數 (e.g. 1/7)。")
+        st.info("💡 使用「精準座標直讀模式」")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
@@ -2387,7 +2387,7 @@ if st.session_state.photo_gallery:
                 st.error(f"UI 顯示錯誤: {e}")
                 
         # 5. 原始數據檢視
-        with st.expander("📊 檢視 AI 抄錄原始數據", expanded=False):
+        with st.expander("📊 檢視原始數據", expanded=False):
             st.markdown("**1. 核心指標摘要**")
             sum_rows_len = len(cache.get("summary_rows", []))
             summary_df = pd.DataFrame([{
