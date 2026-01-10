@@ -1921,7 +1921,7 @@ with st.container(border=True):
                                         if matches: target = int(matches[-1])
                                         
                                         batch_qty = 0
-                                        batch_keywords = ["熱處理", "研磨", "動平衡"]
+                                        batch_keywords = ["熱處理", "輥輪研磨", "動平衡"]
                                         if any(k in col_a for k in batch_keywords):
                                             target_cell_val = ""
                                             for cell in row[1:]:
