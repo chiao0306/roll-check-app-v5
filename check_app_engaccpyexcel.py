@@ -1700,7 +1700,7 @@ st.title("🏭 交貨單稽核")
 
 data_source = st.radio(
     "請選擇資料來源：", 
-    ["📸 上傳照片", "📂 上傳 JSON 檔", "📊 上傳 Excel 檔"], 
+    ["📊 上傳 Excel 檔", "📸 上傳照片", "📂 上傳 JSON 檔"], 
     horizontal=True
 )
 
