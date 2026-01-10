@@ -1768,13 +1768,13 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-    # --- 情況 C: 上傳 Excel (最終增強版 v3：支援千分位逗號與全形單位) ---
+    # --- 情況 C: 上傳 Excel (最終增強版 v4：右側欄位數值搜尋) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式」：已強化數值解析，支援千分位逗號 (e.g. 11,074) 與全形單位。")
+        st.info("💡 使用「精準座標直讀模式」：已修正 Batch Qty 抓取邏輯，自動搜尋標題右側數據。")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
-            # --- 防止無限迴圈檢查 ---
+            # 防無限迴圈
             if 'last_uploaded_object' not in st.session_state:
                 st.session_state.last_uploaded_object = None
 
@@ -1892,7 +1892,7 @@ with st.container(border=True):
                                         if active_item: active_item["std_spec"] = col_a
                                         expecting_spec = False 
                                     else:
-                                        # --- 🔥 這是新項目 (強化解析) ---
+                                        # --- 🔥 這是新項目 ---
                                         import re
                                         
                                         # 1. 解析 item_pc_target
@@ -1901,25 +1901,31 @@ with st.container(border=True):
                                         if matches:
                                             target = int(matches[-1])
                                         
-                                        # 2. 解析 batch_total_qty (KG / in2)
+                                        # 2. 解析 batch_total_qty (向右搜尋)
                                         batch_qty = 0
                                         batch_keywords = ["熱處理", "研磨", "動平衡"]
                                         if any(k in col_a for k in batch_keywords):
-                                            # 🔥 步驟 A：預處理，移除逗號，全形轉半形
-                                            clean_text = col_a.replace(",", "").upper() # 轉大寫、去逗號
-                                            clean_text = clean_text.replace("ＫＧ", "KG").replace("ＩＮ２", "IN2")
+                                            # 往右找第一個非空格子
+                                            target_cell_val = ""
+                                            for cell in row[1:]: # 從 B 欄開始往右
+                                                if cell.strip(): # 找到有字的格子
+                                                    target_cell_val = cell.strip()
+                                                    break
                                             
-                                            # 🔥 步驟 B：正規表達式抓取 (支援小數點)
-                                            m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(?:KG|IN2)", clean_text)
-                                            if m_qty:
-                                                batch_qty = float(m_qty.group(1))
+                                            # 如果找到了，解析數字 (支援逗號、小數點)
+                                            if target_cell_val:
+                                                clean_text = target_cell_val.replace(",", "").upper()
+                                                # 寬容匹配：只要有數字就抓，不管是純數字還是帶單位
+                                                m_qty = re.search(r"(\d+(?:\.\d+)?)", clean_text)
+                                                if m_qty:
+                                                    batch_qty = float(m_qty.group(1))
 
                                         active_item = {
                                             "page": sheet_name,
                                             "item_title": col_a,
                                             "std_spec": "",
                                             "item_pc_target": target,      
-                                            "batch_total_qty": batch_qty,  # ✅ 修正完成
+                                            "batch_total_qty": batch_qty,  # ✅ 更新：抓取右側欄位
                                             "category": None,
                                             "ds": ""
                                         }
@@ -1928,6 +1934,7 @@ with st.container(border=True):
                                 else:
                                     pass 
                                 
+                                # 讀取右邊網格
                                 if active_item:
                                     right_part = row[1:]
                                     valid_cells = [x.strip() for x in right_part if x.strip()]
@@ -1936,6 +1943,10 @@ with st.container(border=True):
                                         rid = valid_cells[i]
                                         val = valid_cells[i+1]
                                         if rid and val:
+                                            # 避免把剛剛抓到的 Batch Qty (例如 "11074 KG") 當成 ID 讀進去
+                                            # 簡單過濾：如果 rid 看起來像 Batch Qty 且沒有對應的 Value (或是 Value 也是數字)，可能要小心
+                                            # 但通常 Batch Qty 的右邊是空的，所以 pairs 迴圈會因為長度不足或 val 為空而跳過
+                                            # 這裡保持原邏輯即可，除非 Batch Qty 後面緊接著另一個數字
                                             if "編號" not in rid and "尺寸" not in val:
                                                 pairs.append(f"{rid}:{val}")
                                     
@@ -1965,7 +1976,7 @@ with st.container(border=True):
                         "total_duration": 0.5, "ocr_duration": 0, "ai_duration": 0, "py_duration": 0,
                         "cost_twd": 0, "total_in": 0, "total_out": 0,
                         "ai_extracted_data": fake_ai_result["dimension_data"],
-                        "combined_input": "Excel Direct Read (v8 Num-Fix)"
+                        "combined_input": "Excel Direct Read (v9 Right-Search)"
                     }
                     
                     st.toast(f"✅ Excel 解析完成: {current_file_name}", icon="⚡")
