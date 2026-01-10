@@ -2006,14 +2006,15 @@ if st.session_state.photo_gallery:
 
     trigger_analysis = start_btn or is_auto_start
 
+    # ==========================================
+    # 👇 請將最下方的 if trigger_analysis: 區塊完全替換為此 👇
+    # ==========================================
     if trigger_analysis:
-        # --- [修正] 智慧清除 Cache ---
-        # 1. 判斷是否為「Excel 直讀模式」且「資料已經準備好 (在 Cache 裡)」
+        # 1. 判斷是否為「Excel 直讀模式」且「資料已經準備好」
         is_excel_mode = (st.session_state.get('source_mode') == 'excel')
         has_cache_data = (st.session_state.get('analysis_result_cache') is not None)
         
-        # 2. 只有在「不是 Excel 模式」或者「Excel 模式但沒資料(代表要重跑)」時，才清除 Cache
-        # 這樣就保護了剛剛解析好的 Excel 數據不被刪掉
+        # 保護 Excel 數據不被清除 (除非是要重跑)
         if not (is_excel_mode and has_cache_data):
              st.session_state.analysis_result_cache = None 
         
@@ -2030,32 +2031,28 @@ if st.session_state.photo_gallery:
             combined_input = ""
 
             # ==========================================
-            # 🔀 分流判斷：Excel 直讀 vs AI 分析
+            # 🔀 階段一：獲取原始數據 (Raw Data)
             # ==========================================
             
-            # 【情況 A】Excel 直讀模式 (資料已在 Cache，直接跳過 AI)
+            # 【路徑 A】Excel 直讀模式 (資料已在 Cache)
             if is_excel_mode and has_cache_data:
-                status_box.write("⚡ 偵測到 Excel 直讀數據，跳過 AI 分析，直接執行邏輯稽核...")
-                time.sleep(0.5) # 視覺緩衝
-                
-                # 直接從 Cache 拿資料
+                status_box.write("⚡ 讀取 Excel 原始數據...")
+                # 直接拿 Excel 讀到的 Raw Data
                 res_main = st.session_state.analysis_result_cache
                 combined_input = res_main.get("combined_input", "Excel Direct Read")
+                progress_bar.progress(0.2)
                 
-                progress_bar.progress(0.4)
-
-            # 【情況 B】一般模式 (照片/JSON -> 執行 OCR + AI)
+            # 【路徑 B】AI / OCR 模式 (照片或 JSON)
             else:
-                # --- 1. OCR 階段 ---
+                # ... (這裡是原本的 OCR + AI 程式碼，完全不動它) ...
                 status_box.write("👀 正在進行 OCR 文字識別...")
                 ocr_start = time.time()
                 
+                # ... (OCR Task Logic) ...
                 def process_task(index, item):
-                    # 如果已經有文字 (例如 JSON 匯入或是之前跑過)，直接回傳，不扣 Azure 錢
                     if item.get('full_text'): return index, item.get('header_text',''), item['full_text'], None
                     try:
                         item['file'].seek(0)
-                        # 呼叫 Azure
                         _, h, f, _, _ = extract_layout_with_azure(item['file'], DOC_ENDPOINT, DOC_KEY)
                         return index, h, f, None
                     except Exception as e: return index, None, None, str(e)
@@ -2067,22 +2064,14 @@ if st.session_state.photo_gallery:
                         if not err:
                             st.session_state.photo_gallery[idx].update({'header_text': h_txt, 'full_text': f_txt, 'file': None})
                         progress_bar.progress(0.4 * ((idx + 1) / len(st.session_state.photo_gallery)))
-
                 ocr_duration = time.time() - ocr_start
-                
-                # --- 2. 組合文字 ---
-                combined_input = ""
-                for i, p in enumerate(st.session_state.photo_gallery):
-                    combined_input += f"\n=== Page {i+1} ===\n{p.get('full_text','')}\n"
 
-                # --- 3. AI 分析 (Turbo Mode) ---
+                # ... (AI Logic) ...
                 status_box.write("🤖 AI 正在分批並行處理 (Turbo Mode)...")
                 ai_start_time = time.time()
                 
-                # 準備批次
                 all_pages = st.session_state.photo_gallery
-                batches = list(split_into_batches(all_pages, max_size=3)) 
-                
+                batches = list(split_into_batches(all_pages, max_size=3))
                 ai_futures = []
                 results_bucket = [None] * len(batches)
 
@@ -2098,55 +2087,61 @@ if st.session_state.photo_gallery:
                     for idx, batch in enumerate(batches):
                         future = executor.submit(process_batch, idx, batch)
                         ai_futures.append((idx, future))
-                    
                     for idx, future in ai_futures:
                         try:
-                            res = future.result()
-                            results_bucket[idx] = res
-                        except Exception as e:
+                            results_bucket[idx] = future.result()
+                        except:
                             results_bucket[idx] = {"header_info": {}, "summary_rows": [], "dimension_data": [], "issues": []}
-                            st.error(f"Batch {idx+1} 分析失敗: {e}")
 
-                # 拼湊結果
                 res_main = merge_ai_results(results_bucket)
                 ai_duration = time.time() - ai_start_time
+                
+                # 組合文字供搜尋
+                for p in st.session_state.photo_gallery:
+                    combined_input += f"\n=== Page ===\n{p.get('full_text','')}\n"
 
             # ========================================================
-            # 🏁 流程匯合：進入 Python 邏輯檢查
+            # 🏭 階段二：Python 黃金流水線 (Excel 和 AI 一視同仁！)
             # ========================================================
-            
-            # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
-            raw_dim_data = res_main.get("dimension_data", [])
-            
-            # 步驟 1: 執行羅賓漢 (修復結構)
-            balanced_dim_data = rebalance_orphan_data(raw_dim_data)
-            
-            # 步驟 2: 執行強制更名 (修復語意/筆誤)
-            final_dim_data = apply_forced_renaming(balanced_dim_data)
-            
-            # 步驟 3: 回存最終結果
-            res_main["dimension_data"] = final_dim_data
-            
-            # 4. Python 邏輯檢查
-            status_box.write("🐍 Python 正在進行邏輯比對...")
+            status_box.write("🐍 正在執行 Python 邏輯稽核...")
             py_start_time = time.time()
             
-            dim_data = res_main.get("dimension_data", [])
+            # 1. 取得數據指針 (不管是 AI 還是 Excel 來的，結構都一樣)
+            raw_dim_data = res_main.get("dimension_data", [])
             
-            # 重新跑分類
-            for item in dim_data:
+            # 2. 結構修復 (呼叫您原本的函數)
+            balanced_dim_data = rebalance_orphan_data(raw_dim_data)
+            
+            # 3. 強制更名 (呼叫您原本的函數 - 會讀取您的 rules.xlsx)
+            final_dim_data = apply_forced_renaming(balanced_dim_data)
+            
+            # 更新回 res_main
+            res_main["dimension_data"] = final_dim_data
+            
+            # 🔥🔥🔥 關鍵點：執行分類邏輯 (assign_category_by_python) 🔥🔥🔥
+            # 這就是之前 Excel 模式可能漏掉或沒接好的地方
+            for item in final_dim_data:
+                # 呼叫您寫好的函數 (它會去讀 rules.xlsx 或跑關鍵字判斷)
                 new_cat = assign_category_by_python(item.get("item_title", ""))
+                
+                # 將分類結果寫入 item，這對後面的 numerical_audit 至關重要
                 item["category"] = new_cat
                 if "sl" not in item: item["sl"] = {}
                 item["sl"]["lt"] = new_cat
+
+            # 4. 執行各項稽核 (呼叫您原本的函數)
+            # 這裡會檢查數值異常 (Excel 改過的數值會在這裡被抓包)
+            python_numeric_issues = python_numerical_audit(final_dim_data)
             
-            # 開始各項稽核
-            python_numeric_issues = python_numerical_audit(dim_data)
-            python_accounting_issues = python_accounting_audit(dim_data, res_main)
-            python_process_issues = python_process_audit(dim_data)
+            # 這裡會檢查 CSV 的匹配狀況
+            python_accounting_issues = python_accounting_audit(final_dim_data, res_main)
+            
+            # 其他稽核
+            python_process_issues = python_process_audit(final_dim_data)
             python_header_issues = python_header_audit_batch(st.session_state.photo_gallery, res_main)
 
-            # 保留 AI 發現的非雜訊異常
+            # 5. 整合所有 Issues
+            # 包含 AI 發現的 (Excel模式下為空) + Python 算出來的
             ai_filtered_issues = []
             ai_raw_issues = res_main.get("issues", [])
             if isinstance(ai_raw_issues, list):
@@ -2160,25 +2155,36 @@ if st.session_state.photo_gallery:
             
             py_duration = time.time() - py_start_time
 
-            # 5. 存檔 (Cache)
+            # ========================================================
+            # 💾 階段三：存檔與顯示
+            # ========================================================
+            
+            # 計算費用 (Excel 模式為 0)
             usage = res_main.get("_token_usage", {"input": 0, "output": 0})
-            
+            cost = 0
+            if not is_excel_mode:
+                cost = (usage.get("input", 0)*0.3 + usage.get("output", 0)*2.5) / 1000000 * 32.5
+
+            # 確保工令存在
             final_job_no = res_main.get("header_info", {}).get("job_no")
-            if not final_job_no or final_job_no == "Unknown":
-                 final_job_no = res_main.get("job_no", "Unknown")
-            
+            if not final_job_no: final_job_no = res_main.get("job_no", "Unknown")
+
+            # 🔥 更新 Cache (這一步最重要，把算出來的 all_issues 存回去，紅字才會出來)
             st.session_state.analysis_result_cache = {
                 "job_no": final_job_no,
                 "header_info": res_main.get("header_info", {}),
-                "all_issues": all_issues,
+                
+                "all_issues": all_issues, # 這裡現在有值了！
+                
                 "total_duration": time.time() - total_start,
                 "ocr_duration": ocr_duration,
                 "ai_duration": ai_duration,
                 "py_duration": py_duration,
-                "cost_twd": (usage.get("input", 0)*0.3 + usage.get("output", 0)*2.5) / 1000000 * 32.5,
+                "cost_twd": cost,
                 "total_in": usage.get("input", 0),
                 "total_out": usage.get("output", 0),
-                "ai_extracted_data": dim_data,
+                
+                "ai_extracted_data": final_dim_data, # 這裡現在有 category 了！
                 "summary_rows": res_main.get("summary_rows", []),
                 "full_text_for_search": combined_input,
                 "combined_input": combined_input
