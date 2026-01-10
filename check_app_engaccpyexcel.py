@@ -397,17 +397,26 @@ def agent_unified_check(combined_input, full_text_for_search, api_key, model_nam
 
 # --- 平行處理輔助函式 ---
 
-# --- 強制更名官 (正式靜音版) ---
 def apply_forced_renaming(dimension_data):
     """
-    功能：讀取 Excel 強制改名。
-    邏輯：使用「包含 (in)」邏輯，修正多餘符號或括號導致的匹配失敗。
+    功能：讀取 Excel 強制改名 (v2: 防彈背心版)。
+    修正：
+    1. 加入 safe_str 防止 NaN 變成 "nan" 字串導致錯誤匹配。
+    2. 強化 clean_key 邏輯。
     """
     if not dimension_data: return dimension_data
     import pandas as pd
     
+    # 🔥 [新增] 防彈衣小幫手
+    def safe_str(val):
+        if val is None: return ""
+        s = str(val).strip()
+        if s.lower() in ['nan', 'none', 'null']: return ""
+        return s
+
     def clean_key(text):
-        t = str(text).upper().replace(" ", "").replace("\n", "").replace("\r", "")
+        # 使用 safe_str 取代原本的 str()
+        t = safe_str(text).upper().replace(" ", "").replace("\n", "").replace("\r", "")
         t = t.replace("（", "(").replace("）", ")")
         return t.strip()
 
@@ -417,104 +426,117 @@ def apply_forced_renaming(dimension_data):
         df.columns = [c.strip() for c in df.columns]
         
         for i, row in df.iterrows():
-            orig = str(row.get('Item_Name', '')).strip()
-            target = str(row.get('Force_Rename', '')).strip()
+            # 🔥 使用 safe_str 讀取，避免空行變成 "nan"
+            orig = safe_str(row.get('Item_Name'))
+            target = safe_str(row.get('Force_Rename'))
             
-            if orig and target and target.lower() != 'nan':
+            # 因為 safe_str 會把 nan 變空字串，所以這裡只要判斷 if orig 即可
+            if orig and target:
                 rename_map[clean_key(orig)] = target
     except:
-        pass # 正式版安靜失敗，不干擾流程
+        pass 
 
     # 執行比對
     for item in dimension_data:
-        old_title = item.get('item_title', '')
+        old_title = safe_str(item.get('item_title')) # 這裡也防護一下
+        
+        if not old_title: continue # 沒標題就跳過
+
         ai_clean_key = clean_key(old_title)
         
-        # 檢查 Excel 的 Key 是否包含在 AI 的標題中
         for rule_k, rule_v in rename_map.items():
-            if rule_k in ai_clean_key:
+            # 確保 rule_k 不是空的，不然 'if "" in string' 永遠為真
+            if rule_k and rule_k in ai_clean_key:
                 item['item_title'] = rule_v
                 item['_original_title'] = old_title
                 break 
             
     return dimension_data
 
-# --- 羅賓漢演算法 (劫富濟貧 v1) ---
 def rebalance_orphan_data(dimension_data):
     """
-    功能：解決「上一項的尾巴被誤判給下一項」的問題。
-    邏輯：
-    1. 遍歷清單，檢查相鄰的兩項 (Item A, Item B)。
-    2. 如果 A 的數量 < A的目標 (缺) 且 B 的數量 > B的目標 (多)。
-    3. 且 (B的多出量) 大約等於 (A的缺口)。
-    4. 將 B 的「前段數據」搬移給 A 的「後段」。
+    功能：羅賓漢演算法 (v2: 防彈背心版)。
+    修正：
+    1. 加入 safe_str 處理 ds 字串。
+    2. 加入 safe_int 處理 target (防止 4.0 或 NaN 造成 int() 崩潰)。
     """
     if not dimension_data: return dimension_data
     
-    # 先做一個深拷貝以防萬一
     import copy
     data = copy.deepcopy(dimension_data)
     
-    # 輔助：計算 ds 字串裡的項目數
-    def count_ds(ds_str):
-        if not ds_str: return 0
-        return len([x for x in ds_str.split("|") if ":" in x])
+    # 🔥 [新增] 防彈衣小幫手
+    def safe_str(val):
+        if val is None: return ""
+        s = str(val).strip()
+        if s.lower() in ['nan', 'none', 'null']: return ""
+        return s
 
-    # 輔助：拆解與重組
+    # 🔥 [新增] 數字防彈衣 (處理 "4.0", NaN, None)
+    def safe_int(val):
+        if val is None: return 0
+        s = str(val).strip()
+        if not s or s.lower() in ['nan', 'none', 'null']: return 0
+        try:
+            # 先轉 float 處理 "4.0" 這種情況，再轉 int
+            return int(float(s))
+        except:
+            return 0
+
     def split_ds(ds_str):
-        return [x for x in ds_str.split("|") if ":" in x]
+        # 確保傳進來的一定是字串
+        s = safe_str(ds_str)
+        if not s: return []
+        return [x for x in s.split("|") if ":" in x]
     
     def join_ds(list_data):
         return "|".join(list_data)
 
-    # 開始巡邏 (從第一項看到倒數第二項)
+    # 開始巡邏
     for i in range(len(data) - 1):
         item_a = data[i]
         item_b = data[i+1]
         
-        # 1. 取得目標值 (Target)
-        # 注意：要確保您的 JSON 欄位名稱正確，這裡假設是 'item_pc_target' 或 'target'
-        target_a = int(item_a.get('item_pc_target', 0) or item_a.get('target', 0))
-        target_b = int(item_b.get('item_pc_target', 0) or item_b.get('target', 0))
+        # 1. 取得目標值 (使用 safe_int 防崩潰)
+        # 優先抓 item_pc_target，沒有則抓 target
+        target_a = safe_int(item_a.get('item_pc_target') or item_a.get('target'))
+        target_b = safe_int(item_b.get('item_pc_target') or item_b.get('target'))
         
-        # 如果沒有目標值，就沒辦法玩了，跳過
         if target_a == 0 or target_b == 0: continue
         
-        # 2. 取得實際值 (Actual String)
-        list_a = split_ds(item_a.get('ds', ''))
-        list_b = split_ds(item_b.get('ds', ''))
+        # 2. 取得實際值 (使用 safe_str 處理 ds)
+        ds_a = safe_str(item_a.get('ds'))
+        ds_b = safe_str(item_b.get('ds'))
+        
+        list_a = split_ds(ds_a)
+        list_b = split_ds(ds_b)
         
         len_a = len(list_a)
         len_b = len(list_b)
         
         # 3. 計算缺口與盈餘
-        shortage_a = target_a - len_a   # A 缺多少 (例如 12 - 7 = 5)
-        surplus_b = len_b - target_b    # B 多多少 (例如 17 - 12 = 5)
+        shortage_a = target_a - len_a
+        surplus_b = len_b - target_b
         
         # 4. 判定是否為「誤判案例」
-        # 條件：A 有缺，B 有多，且 B 多出來的量剛好能補 A (或稍微多一點點也行)
-        # 這裡設定嚴格一點：B 多出來的量 >= A 缺的量
         if shortage_a > 0 and surplus_b >= shortage_a:
             
-            # 🔥 執行搬移手術
-            move_count = shortage_a # 搬移數量 = A 缺的數量
+            # 執行搬移
+            move_count = shortage_a
             
-            # 從 B 的頭部切下 move_count 個
             moving_part = list_b[:move_count]
             remaining_b = list_b[move_count:]
             
-            # 接到 A 的尾部
             new_list_a = list_a + moving_part
             
             # 5. 更新資料
             item_a['ds'] = join_ds(new_list_a)
             item_b['ds'] = join_ds(remaining_b)
             
-            # 更新後要在 Console 印出紀錄 (方便除錯)
-            print(f"⚖️ 自動平衡觸發：從 [{item_b.get('item_title')}] 移了 {move_count} 筆給 [{item_a.get('item_title')}]")
-            
-            # 注意：一旦搬移過，當前的 item_b (現在變成 item_a 的樣子了) 
-            # 在下一次迴圈變成 item_a 時，資料已經是正確的，可以繼續往下檢查
+            # 安全取得標題以供列印
+            title_a = safe_str(item_a.get('item_title'))
+            title_b = safe_str(item_b.get('item_title'))
+            print(f"⚖️ 自動平衡觸發：從 [{title_b}] 移了 {move_count} 筆給 [{title_a}]")
             
     return data
 
