@@ -1984,53 +1984,55 @@ if st.session_state.photo_gallery:
     trigger_analysis = start_btn or is_auto_start
 
     if trigger_analysis:
-        # --- [修改 1] 智慧清除 Cache ---
-        # 如果是 Excel 直讀模式且已經有結果 (剛上傳完)，就不要清除 Cache，否則數據會不見！
-        # 其他模式 (照片/JSON) 則強制清除，確保是新的分析
-        is_excel_direct_mode = (st.session_state.get('source_mode') == 'excel' and st.session_state.analysis_result_cache)
+        # --- [修正] 智慧清除 Cache ---
+        # 1. 判斷是否為「Excel 直讀模式」且「資料已經準備好 (在 Cache 裡)」
+        is_excel_mode = (st.session_state.get('source_mode') == 'excel')
+        has_cache_data = (st.session_state.get('analysis_result_cache') is not None)
         
-        if not is_excel_direct_mode:
-            st.session_state.analysis_result_cache = None 
-            
+        # 2. 只有在「不是 Excel 模式」或者「Excel 模式但沒資料(代表要重跑)」時，才清除 Cache
+        # 這樣就保護了剛剛解析好的 Excel 數據不被刪掉
+        if not (is_excel_mode and has_cache_data):
+             st.session_state.analysis_result_cache = None 
+        
         st.session_state.auto_start_analysis = False
         total_start = time.time()
         
         with st.status("總稽核官正在進行全方位分析...", expanded=True) as status_box:
             progress_bar = st.progress(0)
             
-            # 初始化變數 (確保後面 Python 邏輯有東西可讀)
-            res_main = {}
+            # 初始化變數
             ocr_duration = 0
             ai_duration = 0
+            res_main = {}
             combined_input = ""
 
             # ==========================================
             # 🔀 分流判斷：Excel 直讀 vs AI 分析
             # ==========================================
-            if is_excel_direct_mode:
+            
+            # 【情況 A】Excel 直讀模式 (資料已在 Cache，直接跳過 AI)
+            if is_excel_mode and has_cache_data:
                 status_box.write("⚡ 偵測到 Excel 直讀數據，跳過 AI 分析，直接執行邏輯稽核...")
-                time.sleep(0.5) # 給個視覺緩衝
+                time.sleep(0.5) # 視覺緩衝
                 
                 # 直接從 Cache 拿資料
                 res_main = st.session_state.analysis_result_cache
                 combined_input = res_main.get("combined_input", "Excel Direct Read")
                 
-                # 模擬進度條跑完
                 progress_bar.progress(0.4)
-                
+
+            # 【情況 B】一般模式 (照片/JSON -> 執行 OCR + AI)
             else:
-                # ==========================================
-                # 方案 A: 標準 AI 流程 (OCR + Gemini)
-                # ==========================================
-                
-                # 1. OCR
+                # --- 1. OCR 階段 ---
                 status_box.write("👀 正在進行 OCR 文字識別...")
                 ocr_start = time.time()
                 
                 def process_task(index, item):
+                    # 如果已經有文字 (例如 JSON 匯入或是之前跑過)，直接回傳，不扣 Azure 錢
                     if item.get('full_text'): return index, item.get('header_text',''), item['full_text'], None
                     try:
                         item['file'].seek(0)
+                        # 呼叫 Azure
                         _, h, f, _, _ = extract_layout_with_azure(item['file'], DOC_ENDPOINT, DOC_KEY)
                         return index, h, f, None
                     except Exception as e: return index, None, None, str(e)
@@ -2045,35 +2047,30 @@ if st.session_state.photo_gallery:
 
                 ocr_duration = time.time() - ocr_start
                 
-                # 2. 組合文字
+                # --- 2. 組合文字 ---
                 combined_input = ""
                 for i, p in enumerate(st.session_state.photo_gallery):
                     combined_input += f"\n=== Page {i+1} ===\n{p.get('full_text','')}\n"
 
-                # ==========================================
-                # 🚀 3. AI 並行分析 (Turbo Mode)
-                # ==========================================
+                # --- 3. AI 分析 (Turbo Mode) ---
                 status_box.write("🤖 AI 正在分批並行處理 (Turbo Mode)...")
                 ai_start_time = time.time()
                 
-                # 1. 準備批次
+                # 準備批次
                 all_pages = st.session_state.photo_gallery
                 batches = list(split_into_batches(all_pages, max_size=3)) 
                 
                 ai_futures = []
                 results_bucket = [None] * len(batches)
 
-                # 定義一個子任務函數
                 def process_batch(batch_idx, batch_pages):
                     batch_text = ""
                     for p in batch_pages:
                         real_idx = all_pages.index(p) + 1 
                         batch_text += f"\n=== Page {real_idx} ===\n{p.get('full_text','')}\n"
-                    
                     full_text_all = "".join([p.get('full_text','') for p in all_pages])
                     return agent_unified_check(batch_text, full_text_all, GEMINI_KEY, main_model_name)
 
-                # 2. 同時發射火箭
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                     for idx, batch in enumerate(batches):
                         future = executor.submit(process_batch, idx, batch)
@@ -2087,18 +2084,12 @@ if st.session_state.photo_gallery:
                             results_bucket[idx] = {"header_info": {}, "summary_rows": [], "dimension_data": [], "issues": []}
                             st.error(f"Batch {idx+1} 分析失敗: {e}")
 
-                # 3. 拼湊結果
+                # 拼湊結果
                 res_main = merge_ai_results(results_bucket)
-                
-                # 更新全卷文字供 Cache 使用
-                combined_input = ""
-                for i, p in enumerate(all_pages):
-                    combined_input += f"\n=== Page {i+1} ===\n{p.get('full_text','')}\n"
-                
                 ai_duration = time.time() - ai_start_time
 
             # ========================================================
-            # 🏁 流程匯合：以下邏輯無論是 Excel 還是 AI 都會執行
+            # 🏁 流程匯合：進入 Python 邏輯檢查
             # ========================================================
             
             # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
@@ -2113,65 +2104,42 @@ if st.session_state.photo_gallery:
             # 步驟 3: 回存最終結果
             res_main["dimension_data"] = final_dim_data
             
-            # ========================================================
-            # 🔥 插入點：資料修復流水線 (結構修復 -> 語意修復)
-            # ========================================================
-            raw_dim_data = res_main.get("dimension_data", [])
-            
-            # 步驟 1: 執行羅賓漢 (修復結構)
-            # 先解決視覺斷行誤判 (例如 7個變12個的問題)
-            balanced_dim_data = rebalance_orphan_data(raw_dim_data)
-            
-            # 步驟 2: 執行強制更名 (修復語意/筆誤)
-            # 讀取 Excel Force_Rename，把 "軸頸再生" 強制改名為 "軸頸銲補"
-            # 傳入的是已經結構正確的 balanced_dim_data
-            final_dim_data = apply_forced_renaming(balanced_dim_data)
-            
-            # 步驟 3: 回存最終結果 (確保後續所有流程都用新名字)
-            res_main["dimension_data"] = final_dim_data
-            # ========================================================
-
-            # 4. Python 邏輯檢查 (加入計時)
+            # 4. Python 邏輯檢查
             status_box.write("🐍 Python 正在進行邏輯比對...")
+            py_start_time = time.time()
             
-            py_start_time = time.time() # ⏱️ [計時開始] Python
-            
-            # 這裡直接取用剛剛修復並改名後的 final_dim_data (從 res_main 拿)
             dim_data = res_main.get("dimension_data", [])
             
-            # 重新跑分類 (重要！因為名字剛被我們改成銲補，這裡分類就會自動變成銲補)
+            # 重新跑分類
             for item in dim_data:
                 new_cat = assign_category_by_python(item.get("item_title", ""))
                 item["category"] = new_cat
                 if "sl" not in item: item["sl"] = {}
                 item["sl"]["lt"] = new_cat
             
-            # 開始各項稽核 (傳入修復後的資料)
+            # 開始各項稽核
             python_numeric_issues = python_numerical_audit(dim_data)
             python_accounting_issues = python_accounting_audit(dim_data, res_main)
             python_process_issues = python_process_audit(dim_data)
             python_header_issues = python_header_audit_batch(st.session_state.photo_gallery, res_main)
 
-            # 🔥 [關鍵補救] 這一塊必須留著！不能全刪！
+            # 保留 AI 發現的非雜訊異常
             ai_filtered_issues = []
             ai_raw_issues = res_main.get("issues", [])
             if isinstance(ai_raw_issues, list):
                 for i in ai_raw_issues:
                     if isinstance(i, dict):
                         i['source'] = '🤖 總稽核 AI'
-                        # 過濾掉一些沒用的 AI 雜訊
                         if not any(k in i.get("issue_type", "") for k in ["流程", "規格提取失敗", "未匹配"]):
                             ai_filtered_issues.append(i)
 
-            # 🔥 這裡執行合併 (現在 ai_filtered_issues 已經復活了，不會再報錯)
             all_issues = ai_filtered_issues + python_numeric_issues + python_accounting_issues + python_process_issues + python_header_issues
             
-            py_duration = time.time() - py_start_time # ⏱️ [計時結束] Python
+            py_duration = time.time() - py_start_time
 
             # 5. 存檔 (Cache)
             usage = res_main.get("_token_usage", {"input": 0, "output": 0})
             
-            # 修正工令讀取邏輯
             final_job_no = res_main.get("header_info", {}).get("job_no")
             if not final_job_no or final_job_no == "Unknown":
                  final_job_no = res_main.get("job_no", "Unknown")
@@ -2182,15 +2150,12 @@ if st.session_state.photo_gallery:
                 "all_issues": all_issues,
                 "total_duration": time.time() - total_start,
                 "ocr_duration": ocr_duration,
-                "ai_duration": ai_duration,     # AI 耗時
-                "py_duration": py_duration,     # Python 耗時
-                
+                "ai_duration": ai_duration,
+                "py_duration": py_duration,
                 "cost_twd": (usage.get("input", 0)*0.3 + usage.get("output", 0)*2.5) / 1000000 * 32.5,
                 "total_in": usage.get("input", 0),
                 "total_out": usage.get("output", 0),
-                
                 "ai_extracted_data": dim_data,
-                "freight_target": res_main.get("freight_target", 0),
                 "summary_rows": res_main.get("summary_rows", []),
                 "full_text_for_search": combined_input,
                 "combined_input": combined_input
