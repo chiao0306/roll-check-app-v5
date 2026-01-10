@@ -1768,16 +1768,16 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-    # --- 情況 C: 上傳 Excel (最終增強版：支援目標數與批量總重解析) ---
+     # --- 情況 C: 上傳 Excel (最終增強版 v2：支援 KG 與 in2 單位解析) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式」：已強化標題解析 (Target/Batch Qty) 與特規支援。")
+        st.info("💡 使用「精準座標直讀模式」：已強化標題解析，支援 KG (熱處理) 與 in2 (研磨/動平衡) 單位提取。")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
             try:
                 current_file_name = uploaded_xlsx.name
                 
-                # 1. 讀取 Excel (強制轉字串，不緩存以確保重讀)
+                # 1. 讀取 Excel (強制轉字串)
                 df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None, header=None, dtype=str)
                 
                 st.session_state.source_mode = 'excel'
@@ -1824,7 +1824,7 @@ with st.container(border=True):
                             current_zone = "HEADER"
                             continue
 
-                        # 明細觸發：偵測 D欄=編號 & F欄=尺寸
+                        # 明細觸發
                         if "編號" in str(row[3]) and "尺寸" in str(row[5]):
                             current_zone = "DETAIL"
                             continue 
@@ -1889,35 +1889,31 @@ with st.container(border=True):
                                     if active_item: active_item["std_spec"] = col_a
                                     expecting_spec = False 
                                 else:
-                                    # --- 🔥 這是新項目 (解析邏輯更新) ---
+                                    # --- 🔥 這是新項目 (解析邏輯更新 v2) ---
                                     import re
                                     
-                                    # 1. 解析 item_pc_target (抓最後一個括號內的數字)
+                                    # 1. 解析 item_pc_target
                                     target = 0
-                                    # 支援 (4), (4SET), (4PC) 等格式
                                     matches = re.findall(r"[（(](\d+)[A-Za-z\s]*[)）]", col_a)
                                     if matches:
-                                        target = int(matches[-1]) # 取最後一個匹配
+                                        target = int(matches[-1])
                                     
-                                    # 2. 解析 batch_total_qty (熱處理/研磨/動平衡)
+                                    # 2. 解析 batch_total_qty (KG / in2)
                                     batch_qty = 0
                                     batch_keywords = ["熱處理", "研磨", "動平衡"]
                                     if any(k in col_a for k in batch_keywords):
-                                        # 優先抓取 "2425KG" 格式
-                                        m_qty = re.search(r"(\d+(?:\.\d+)?)KG", col_a, re.IGNORECASE)
+                                        # 🔥 修正：同時偵測 KG 或 in2 (忽略大小寫)
+                                        # 範例：2425KG, 1500in2, 1500 IN2
+                                        m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(?:KG|in2)", col_a, re.IGNORECASE)
                                         if m_qty:
                                             batch_qty = float(m_qty.group(1))
-                                        else:
-                                            # 如果沒寫 KG，但有這類關鍵字，也許可以嘗試抓取最大的數字？
-                                            # 目前先保守只抓 KG，避免誤抓 "W3" 的 3
-                                            pass
 
                                     active_item = {
                                         "page": sheet_name,
                                         "item_title": col_a,
                                         "std_spec": "",
-                                        "item_pc_target": target,      # ✅ 更新
-                                        "batch_total_qty": batch_qty,  # ✅ 更新
+                                        "item_pc_target": target,      
+                                        "batch_total_qty": batch_qty,  # ✅ 已更新
                                         "category": None,
                                         "ds": ""
                                     }
