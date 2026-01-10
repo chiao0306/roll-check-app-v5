@@ -1608,25 +1608,26 @@ def clean_job_no_list(job_list):
     
 def python_header_audit_batch(photo_gallery, ai_res_json):
     """
-    Python 表頭稽核官 (Batch 架構適配版 v32: 整合工令淨化 + 日期一致性檢查)
+    Python 表頭稽核官 (Batch 架構適配版 v33: 防崩潰日期檢查)
+    修正：針對 Excel 可能出現的非字串格式 (None, NaN, datetime) 進行強制轉型，
+    避免因資料髒亂導致 .strip() 報錯而中斷稽核。
     """
     header_issues = []
     import re
     from datetime import datetime
 
-    # --- 1. 混單檢查 (利用 OCR 原始文字) ---
-    job_pattern = r"([WROY][A-Z0-9]{9})" # 抓 10 碼
+    # --- 1. 混單檢查 (OCR) ---
+    job_pattern = r"([WROY][A-Z0-9]{9})"
     found_jobs_map = {} 
 
     for idx, item in enumerate(photo_gallery):
         txt = item.get('full_text', '').upper().replace(" ", "").replace("-", "")
         matches = re.findall(job_pattern, txt)
         
-        # 呼叫外部定義的淨化函式 (如果您的程式環境裡有定義的話)
         if 'clean_job_no_list' in globals():
             valid_matches = clean_job_no_list(matches)
         else:
-            valid_matches = matches # fallback
+            valid_matches = matches 
 
         for job in valid_matches:
             if job not in found_jobs_map: found_jobs_map[job] = []
@@ -1641,13 +1642,23 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(OCR)"
         })
 
-    # --- 2. 日期一致性檢查 (新增邏輯 🔥) ---
-    # 從 summary_rows 抓取每一行的日期，而不只是看 header_info 的第一筆
+    # --- 2. 日期一致性檢查 (修正崩潰點 🔥) ---
     summary_rows = ai_res_json.get("summary_rows", [])
     
-    # A. 預定交貨日期 (Scheduled Date)
-    # 過濾掉空值，只看有寫日期的
-    all_sch_dates = [r.get('scheduled_date').strip() for r in summary_rows if r.get('scheduled_date')]
+    # 輔助函式：安全取得字串日期
+    def safe_get_date_str(row, key):
+        val = row.get(key)
+        # 如果是 None 或 NaN，回傳 None 讓後面過濾掉
+        if val is None or str(val).lower() == 'nan': return None
+        # 強制轉字串再 strip，避免 AttributeError
+        return str(val).strip()
+
+    # A. 預定交貨日期
+    all_sch_dates = [
+        safe_get_date_str(r, 'scheduled_date') 
+        for r in summary_rows 
+        if safe_get_date_str(r, 'scheduled_date')
+    ]
     unique_sch = set(all_sch_dates)
     
     if len(unique_sch) > 1:
@@ -1658,8 +1669,12 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(Python)"
         })
 
-    # B. 實際交貨日期 (Actual Date)
-    all_act_dates = [r.get('actual_date').strip() for r in summary_rows if r.get('actual_date')]
+    # B. 實際交貨日期
+    all_act_dates = [
+        safe_get_date_str(r, 'actual_date') 
+        for r in summary_rows 
+        if safe_get_date_str(r, 'actual_date')
+    ]
     unique_act = set(all_act_dates)
     
     if len(unique_act) > 1:
@@ -1670,11 +1685,11 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(Python)"
         })
 
-    # --- 3. 格式與日期邏輯 (利用 Header Info 做主要判定) ---
+    # --- 3. 格式與日期邏輯 ---
     h_info = ai_res_json.get("header_info", {})
     
     # 工令格式檢查
-    ai_job = h_info.get("job_no", "Unknown")
+    ai_job = str(h_info.get("job_no", "Unknown")) # 這裡也加個 str 保險
     if ai_job and ai_job != "Unknown":
         clean_job = ai_job.upper().replace(" ", "").replace("-", "")
         if not re.match(r"^[WROY][A-Z0-9]{9}$", clean_job):
@@ -1685,15 +1700,19 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
                 "source": "🐍 表頭稽核(AI)"
             })
 
-    # 逾期檢查 (這裡還是拿 header_info 裡的主日期來比對，通常是第一筆)
-    d_sch = h_info.get("scheduled_date", "Unknown")
-    d_act = h_info.get("actual_date", "Unknown")
+    # 逾期檢查
+    d_sch = str(h_info.get("scheduled_date", "Unknown"))
+    d_act = str(h_info.get("actual_date", "Unknown"))
     
     if d_sch != "Unknown" and d_act != "Unknown":
         try:
             # 支援 Excel 可能產生的不同分隔符
             d_sch_clean = d_sch.replace("-", "/").replace(".", "/")
             d_act_clean = d_act.replace("-", "/").replace(".", "/")
+            
+            # 有時候 Excel 讀進來會變成 "2025-01-01 00:00:00"，要切掉時間
+            if " " in d_sch_clean: d_sch_clean = d_sch_clean.split(" ")[0]
+            if " " in d_act_clean: d_act_clean = d_act_clean.split(" ")[0]
             
             dt_sch = datetime.strptime(d_sch_clean, "%Y/%m/%d")
             dt_act = datetime.strptime(d_act_clean, "%Y/%m/%d")
