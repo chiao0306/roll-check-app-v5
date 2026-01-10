@@ -1768,195 +1768,214 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-     # --- 情況 C: 上傳 Excel (最終版: 鎖定「注意事項」為結束點) ---
+    # --- 情況 C: 上傳 Excel (修復版：植入 Python 直讀引擎) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式 (最終版)」：鎖定「注意事項」作為明細結束點。")
+        st.info("💡 使用「精準座標直讀模式」：系統將直接解析 Excel 格子，速度極快且不消耗 AI 額度。")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
             try:
                 current_file_name = uploaded_xlsx.name
-                # 1. 讀取 Excel (全卷讀取)
-                df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None, header=None, dtype=str)
-                
-                st.session_state.source_mode = 'excel'
-                st.session_state.last_loaded_xlsx_name = current_file_name
-                
-                fake_ai_result = {
-                    "header_info": {},
-                    "summary_rows": [],
-                    "dimension_data": [],
-                    "issues": [],
-                    "_token_usage": {"input": 0, "output": 0}
-                }
-                st.session_state.photo_gallery = []
-
-                # --- 關鍵字定義 ---
-                KEY_PAGE_START = "工件檢驗紀錄單"   # 頁面開始
-                KEY_SUMMARY_ANCHOR = "名稱及規範"    # 總表定位
-                KEY_DETAIL_START = "規範標準"        # 明細開始
-                KEY_STOP_SIGN = "注意事項"           # 🛑 唯一指定結束點
-
-                # 狀態機
-                current_zone = "SEARCHING" 
-                active_item = None
-                expecting_spec = False
-                summary_header_row_idx = -1 
-
-                for sheet_name, df in df_dict.items():
-                    # 清洗數據
-                    df = df.fillna("").astype(str)
-                    df = df.replace(r'\n', '', regex=True).replace(r'\r', '', regex=True)
-                    df = df.replace('nan', '', regex=False)
-                    rows = df.values.tolist()
+                # 檢查是否為新檔案，避免重複執行
+                if st.session_state.get('last_loaded_xlsx_name') != current_file_name:
                     
-                    for r_idx, row in enumerate(rows):
-                        row_str = "".join(row).replace(" ", "")
-                        col_a = str(row[0]).strip() # A欄內容
-                        
-                        # =================================================
-                        # 1. 全域狀態切換
-                        # =================================================
-                        
-                        # A. 發現新頁面 -> 重置為 HEADER
-                        if KEY_PAGE_START in row_str:
-                            current_zone = "HEADER"
-                            continue
+                    # 1. 讀取 Excel (全卷讀取，轉成純字串矩陣)
+                    df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None, header=None, dtype=str)
+                    
+                    st.session_state.source_mode = 'excel'
+                    st.session_state.last_loaded_xlsx_name = current_file_name
+                    st.session_state.photo_gallery = []
+                    
+                    # 準備結果容器
+                    fake_ai_result = {
+                        "header_info": {},
+                        "summary_rows": [],
+                        "dimension_data": [],
+                        "issues": [],
+                        "_token_usage": {"input": 0, "output": 0}
+                    }
 
-                        # B. 發現明細表頭 (斜線格) -> 切換 DETAIL
-                        if KEY_DETAIL_START in col_a: 
-                            current_zone = "DETAIL"
-                            continue 
+                    # --- 關鍵字定義 (錨點) ---
+                    KEY_PAGE_START = "工件檢驗紀錄單"   # 頁面開始
+                    KEY_SUMMARY_ANCHOR = "名稱及規範"    # 總表定位
+                    KEY_DETAIL_START = "規範標準"        # 明細開始
+                    KEY_STOP_SIGN = "注意事項"           # 🛑 唯一指定結束點
 
-                        # 🔥 C. 發現結束點 -> 停止 DETAIL
-                        # 只要 A 欄包含「注意事項」，就視為這張單據的數據結束了
-                        if current_zone == "DETAIL":
-                            if KEY_STOP_SIGN in col_a:
-                                current_zone = "SEARCHING"
-                                active_item = None # 斷開連結
-                                expecting_spec = False
+                    # 狀態機變數
+                    current_zone = "SEARCHING" 
+                    active_item = None
+                    expecting_spec = False
+                    summary_header_row_idx = -1 
+
+                    # --- 開始掃描每一個 Sheet ---
+                    for sheet_name, df in df_dict.items():
+                        # 資料清洗：填補空值、移除換行
+                        df = df.fillna("").astype(str)
+                        df = df.replace(r'\n', '', regex=True).replace(r'\r', '', regex=True)
+                        df = df.replace('nan', '', regex=False)
+                        rows = df.values.tolist()
+                        
+                        for r_idx, row in enumerate(rows):
+                            # 將整列串接成字串，方便找關鍵字
+                            row_str = "".join(row).replace(" ", "")
+                            col_a = str(row[0]).strip() # A欄內容
+                            
+                            # =================================================
+                            # 1. 全域狀態切換偵測
+                            # =================================================
+                            
+                            # A. 發現新頁面 -> 重置為 HEADER 模式
+                            if KEY_PAGE_START in row_str:
+                                current_zone = "HEADER"
                                 continue
 
-                        # =================================================
-                        # 2. 區域處理邏輯
-                        # =================================================
-                        
-                        if current_zone == "HEADER":
-                            # 抓工令 (A欄是標題，B欄是值)
-                            if "工令" in col_a:
-                                job_val = str(row[1]).strip()
-                                # 簡單驗證 (W/R/O/Y 開頭 + 10碼)
-                                if len(job_val) >= 10 and job_val[0] in ['W', 'R', 'O', 'Y']:
-                                    fake_ai_result["header_info"]["job_no"] = job_val
-                                    
-                            # 檢查是否進入總表區
-                            if KEY_SUMMARY_ANCHOR in row_str:
-                                current_zone = "SUMMARY"
-                                summary_header_row_idx = r_idx
-                                continue
+                            # B. 發現明細表頭 (斜線格) -> 切換 DETAIL 模式
+                            if KEY_DETAIL_START in col_a: 
+                                current_zone = "DETAIL"
+                                continue 
 
-                        elif current_zone == "SUMMARY":
-                            # 跳過表頭 2 行
-                            rel_idx = r_idx - summary_header_row_idx
-                            if rel_idx >= 2:
-                                title_val = str(row[1]).strip() # B欄
-                                
-                                # 停止條件：B欄沒字 或 A欄出現明細關鍵字
-                                if not title_val or KEY_DETAIL_START in col_a:
-                                    pass 
-                                else:
-                                    def safe_float(v):
-                                        try: return float(v)
-                                        except: return 0.0
-                                    
-                                    # 依據您的描述：A=編號, B=名稱, C=單位, D=申請, E=實交, F=位置, G=預定, H=實際
-                                    if len(row) > 7:
-                                        fake_ai_result["summary_rows"].append({
-                                            "page": sheet_name,
-                                            "title": str(row[1]).strip(),
-                                            "apply_qty": safe_float(row[3]),
-                                            "delivery_qty": safe_float(row[4]),
-                                            "scheduled_date": str(row[6]).strip(),
-                                            "actual_date": str(row[7]).strip()
-                                        })
+                            # 🔥 C. 發現結束點 -> 停止 DETAIL
+                            if current_zone == "DETAIL":
+                                if KEY_STOP_SIGN in col_a:
+                                    current_zone = "SEARCHING"
+                                    active_item = None # 斷開連結
+                                    expecting_spec = False
+                                    continue
 
-                        elif current_zone == "DETAIL":
-                            # 1. 判斷 A 欄 (Title / Spec / 延續)
-                            if col_a:
-                                if expecting_spec:
-                                    # 上一行是 Title -> 這一行必是 Spec
-                                    if active_item: active_item["std_spec"] = col_a
-                                    expecting_spec = False # Spec 填完，接下來是數據延續
-                                else:
-                                    # 不在等待 Spec -> 這是新的 Title
-                                    target = 0
-                                    m = re.search(r"[（(](\d+)[)）]", col_a)
-                                    if m: target = int(m.group(1))
-                                    
-                                    active_item = {
-                                        "page": sheet_name,
-                                        "item_title": col_a,
-                                        "std_spec": "",
-                                        "item_pc_target": target,
-                                        "batch_total_qty": 0,
-                                        "category": None,
-                                        "ds": ""
-                                    }
-                                    fake_ai_result["dimension_data"].append(active_item)
-                                    expecting_spec = True # 標記：下一行 A 欄是 Spec
+                            # =================================================
+                            # 2. 區域處理邏輯
+                            # =================================================
                             
-                            else:
-                                # A 欄空白 -> 數據延續 (不論是 Spec 跨列 還是 純數據換行)
-                                pass
-                            
-                            # 2. 讀取右邊網格 (B欄 ~ O欄 -> Index 1 ~ 14)
-                            if active_item:
-                                grid_cells = row[1:15]
-                                pairs = []
-                                # 兩兩一組遍歷
-                                for i in range(0, len(grid_cells) - 1, 2):
-                                    rid = str(grid_cells[i]).strip()
-                                    val = str(grid_cells[i+1]).strip()
+                            # --- [HEADER 模式] 抓工令 ---
+                            if current_zone == "HEADER":
+                                if "工令" in col_a:
+                                    # 嘗試從 B 欄抓
+                                    job_val = str(row[1]).strip()
+                                    # 如果 B 欄是空的，可能是合併儲存格擠在 A 欄，嘗試用 Regex 抓
+                                    if not job_val:
+                                        import re
+                                        m = re.search(r"([WROY][A-Z0-9]{9})", col_a.replace(" ","").replace("-",""))
+                                        if m: job_val = m.group(1)
+
+                                    if len(job_val) >= 10 and job_val[0] in ['W', 'R', 'O', 'Y']:
+                                        fake_ai_result["header_info"]["job_no"] = job_val
+                                        
+                                # 檢查是否進入總表區
+                                if KEY_SUMMARY_ANCHOR in row_str:
+                                    current_zone = "SUMMARY"
+                                    summary_header_row_idx = r_idx
+                                    continue
+
+                            # --- [SUMMARY 模式] 抓總表 ---
+                            elif current_zone == "SUMMARY":
+                                # 跳過表頭 2 行 (項次列 + 日期分流列)
+                                rel_idx = r_idx - summary_header_row_idx
+                                if rel_idx >= 2:
+                                    title_val = str(row[1]).strip() # B欄
                                     
-                                    if rid and val:
-                                        # 過濾表頭雜訊
-                                        if "編號" not in rid and "尺寸" not in val:
-                                            pairs.append(f"{rid}:{val}")
-                                
-                                if pairs:
-                                    if active_item["ds"]:
-                                        active_item["ds"] += "|" + "|".join(pairs)
+                                    # 停止條件：B欄沒字 或 A欄出現明細關鍵字
+                                    if not title_val or KEY_DETAIL_START in col_a:
+                                        pass 
                                     else:
-                                        active_item["ds"] = "|".join(pairs)
+                                        def safe_float(v):
+                                            try: return float(v)
+                                            except: return 0.0
+                                        
+                                        # 依據您的描述：B=名稱, D=申請, E=實交, G=預定, H=實際
+                                        if len(row) > 7:
+                                            fake_ai_result["summary_rows"].append({
+                                                "page": sheet_name,
+                                                "title": str(row[1]).strip(),
+                                                "apply_qty": safe_float(row[3]),
+                                                "delivery_qty": safe_float(row[4]),
+                                                "scheduled_date": str(row[6]).strip(),
+                                                "actual_date": str(row[7]).strip()
+                                            })
 
-                    md_table = df.to_markdown(index=False)
-                    st.session_state.photo_gallery.append({
-                        'file': None,
-                        'table_md': md_table,
-                        'header_text': f"來源分頁: {sheet_name}",
-                        'full_text': f"Excel 直讀模式 (Final) - {sheet_name}",
-                        'raw_json': None,
-                        'real_page': sheet_name
-                    })
+                            # --- [DETAIL 模式] 抓明細 ---
+                            elif current_zone == "DETAIL":
+                                # 1. 判斷 A 欄 (Title / Spec / 延續)
+                                if col_a:
+                                    if expecting_spec:
+                                        # 上一行是 Title -> 這一行必是 Spec
+                                        if active_item: active_item["std_spec"] = col_a
+                                        expecting_spec = False # Spec 填完
+                                    else:
+                                        # 不在等待 Spec -> 這是新的 Title
+                                        import re
+                                        target = 0
+                                        m = re.search(r"[（(](\d+)[)）]", col_a)
+                                        if m: target = int(m.group(1))
+                                        
+                                        active_item = {
+                                            "page": sheet_name,
+                                            "item_title": col_a,
+                                            "std_spec": "",
+                                            "item_pc_target": target,
+                                            "batch_total_qty": 0,
+                                            "category": None,
+                                            "ds": ""
+                                        }
+                                        fake_ai_result["dimension_data"].append(active_item)
+                                        expecting_spec = True # 標記：下一行 A 欄是 Spec
+                                
+                                else:
+                                    # A 欄空白 -> 數據延續
+                                    pass
+                                
+                                # 2. 讀取右邊網格 (B欄 ~ O欄 -> Index 1 ~ 14)
+                                if active_item:
+                                    grid_cells = row[1:15]
+                                    pairs = []
+                                    # 兩兩一組遍歷
+                                    for i in range(0, len(grid_cells) - 1, 2):
+                                        rid = str(grid_cells[i]).strip()
+                                        val = str(grid_cells[i+1]).strip()
+                                        
+                                        if rid and val:
+                                            if "編號" not in rid and "尺寸" not in val:
+                                                pairs.append(f"{rid}:{val}")
+                                    
+                                    if pairs:
+                                        if active_item["ds"]:
+                                            active_item["ds"] += "|" + "|".join(pairs)
+                                        else:
+                                            active_item["ds"] = "|".join(pairs)
 
-                # 存入 Cache
-                st.session_state.analysis_result_cache = {
-                    "job_no": fake_ai_result["header_info"].get("job_no", "Unknown"),
-                    "header_info": fake_ai_result["header_info"],
-                    "summary_rows": fake_ai_result["summary_rows"],
-                    "dimension_data": fake_ai_result["dimension_data"],
-                    "issues": [],
-                    "_token_usage": {"input": 0, "output": 0},
-                    "total_duration": 0.5, "ocr_duration": 0, "ai_duration": 0, "py_duration": 0,
-                    "cost_twd": 0, "total_in": 0, "total_out": 0,
-                    "ai_extracted_data": fake_ai_result["dimension_data"],
-                    "combined_input": "Excel Direct Read (Final)"
-                }
-                
-                st.toast(f"✅ Excel 解析完成: {current_file_name}", icon="🎯")
-                st.session_state.auto_start_analysis = True 
-                st.rerun()
-                
+                        # 建立預覽 (Optional)
+                        md_table = df.to_markdown(index=False)
+                        st.session_state.photo_gallery.append({
+                            'file': None,
+                            'table_md': md_table,
+                            'header_text': f"來源分頁: {sheet_name}",
+                            'full_text': f"Excel 直讀模式 - {sheet_name}",
+                            'raw_json': None,
+                            'real_page': sheet_name
+                        })
+
+                    # 🔥 [關鍵步驟] 將解析結果存入 Cache，這會讓下方的 Trigger 知道要跳過 AI
+                    st.session_state.analysis_result_cache = {
+                        "job_no": fake_ai_result["header_info"].get("job_no", "Unknown"),
+                        "header_info": fake_ai_result["header_info"],
+                        "summary_rows": fake_ai_result["summary_rows"],
+                        "dimension_data": fake_ai_result["dimension_data"],
+                        "issues": [],
+                        "_token_usage": {"input": 0, "output": 0},
+                        "total_duration": 0.5, "ocr_duration": 0, "ai_duration": 0, "py_duration": 0,
+                        "cost_twd": 0, "total_in": 0, "total_out": 0,
+                        "ai_extracted_data": fake_ai_result["dimension_data"],
+                        "combined_input": "Excel Direct Read (Python Engine)"
+                    }
+                    
+                    st.toast(f"✅ Excel 解析完成: {current_file_name}", icon="⚡")
+                    
+                    # 啟動自動分析 (這會觸發 rerun，然後下方的 Trigger 會讀取 Cache)
+                    if st.session_state.enable_auto_analysis:
+                        st.session_state.auto_start_analysis = True
+                    st.rerun()
+                    
+                else:
+                    st.success(f"📊 目前載入 Excel：**{uploaded_xlsx.name}**")
             except Exception as e:
                 st.error(f"Excel 解析失敗: {e}")
 
