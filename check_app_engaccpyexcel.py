@@ -1666,9 +1666,11 @@ def clean_job_no_list(job_list):
     
 def python_header_audit_batch(photo_gallery, ai_res_json):
     """
-    Python 表頭稽核官 (Batch 架構適配版 v33: 防崩潰日期檢查)
-    修正：針對 Excel 可能出現的非字串格式 (None, NaN, datetime) 進行強制轉型，
-    避免因資料髒亂導致 .strip() 報錯而中斷稽核。
+    Python 表頭稽核官 (Batch 架構適配版 v34: 一對一盯人逾期檢查)
+    修正內容：
+    1. [逾期檢查]: 放棄 Header Info，改為遍歷 summary_rows，逐行比對 (實交 vs 預定)。
+    2. [一致性]: 保留全卷日期一致性檢查。
+    3. [防護]: 繼承 v33 的防崩潰機制，確保空行不影響檢查。
     """
     header_issues = []
     import re
@@ -1682,6 +1684,7 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
         txt = item.get('full_text', '').upper().replace(" ", "").replace("-", "")
         matches = re.findall(job_pattern, txt)
         
+        # 呼叫外部定義的淨化函式 (若有)
         if 'clean_job_no_list' in globals():
             valid_matches = clean_job_no_list(matches)
         else:
@@ -1700,24 +1703,35 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(OCR)"
         })
 
-    # --- 2. 日期一致性檢查 (修正崩潰點 🔥) ---
+    # --- 準備工作：取得資料列 ---
     summary_rows = ai_res_json.get("summary_rows", [])
     
-    # 輔助函式：安全取得字串日期
-    def safe_get_date_str(row, key):
-        val = row.get(key)
-        # 如果是 None 或 NaN，回傳 None 讓後面過濾掉
-        if val is None or str(val).lower() == 'nan': return None
-        # 強制轉字串再 strip，避免 AttributeError
-        return str(val).strip()
+    # 🔥 防彈小幫手：清洗日期字串
+    def safe_get_date_str(val):
+        if val is None: return None
+        s = str(val).strip()
+        if not s or s.lower() in ['nan', 'none', 'null']: return None
+        return s
 
-    # A. 預定交貨日期
-    all_sch_dates = [
-        safe_get_date_str(r, 'scheduled_date') 
-        for r in summary_rows 
-        if safe_get_date_str(r, 'scheduled_date')
-    ]
-    unique_sch = set(all_sch_dates)
+    # 日期解析小幫手
+    def parse_date(date_str):
+        try:
+            # 支援 Excel 常見格式
+            clean = date_str.replace("-", "/").replace(".", "/")
+            # 切掉時間部分 (例如 2025/01/01 00:00:00 -> 2025/01/01)
+            if " " in clean: clean = clean.split(" ")[0]
+            return datetime.strptime(clean, "%Y/%m/%d")
+        except:
+            return None
+
+    # ==========================================
+    # 🕵️‍♂️ 2. 日期一致性檢查 (抓混雜)
+    # ==========================================
+    
+    # A. 預定日期一致性
+    all_sch_dates = [safe_get_date_str(r.get('scheduled_date')) for r in summary_rows]
+    valid_sch = [d for d in all_sch_dates if d] # 過濾掉空值
+    unique_sch = set(valid_sch)
     
     if len(unique_sch) > 1:
         header_issues.append({
@@ -1727,13 +1741,10 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(Python)"
         })
 
-    # B. 實際交貨日期
-    all_act_dates = [
-        safe_get_date_str(r, 'actual_date') 
-        for r in summary_rows 
-        if safe_get_date_str(r, 'actual_date')
-    ]
-    unique_act = set(all_act_dates)
+    # B. 實交日期一致性
+    all_act_dates = [safe_get_date_str(r.get('actual_date')) for r in summary_rows]
+    valid_act = [d for d in all_act_dates if d]
+    unique_act = set(valid_act)
     
     if len(unique_act) > 1:
         header_issues.append({
@@ -1743,11 +1754,59 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
             "source": "🐍 表頭稽核(Python)"
         })
 
-    # --- 3. 格式與日期邏輯 ---
-    h_info = ai_res_json.get("header_info", {})
+    # ==========================================
+    # 🕵️‍♂️ 3. 逾期檢查 (改為一對一盯人 🔥)
+    # ==========================================
+    overdue_items = []
     
-    # 工令格式檢查
-    ai_job = str(h_info.get("job_no", "Unknown")) # 這裡也加個 str 保險
+    for row in summary_rows:
+        # 1. 拿出這一行的兩個日期
+        s_sch = safe_get_date_str(row.get('scheduled_date'))
+        s_act = safe_get_date_str(row.get('actual_date'))
+        title = safe_get_date_str(row.get('title')) or "未命名項目"
+
+        # 2. 如果其中一個缺席，就無法比對，跳過
+        if not s_sch or not s_act: continue
+
+        # 3. 解析日期
+        dt_sch = parse_date(s_sch)
+        dt_act = parse_date(s_act)
+        
+        # 4. 如果解析失敗，也跳過
+        if not dt_sch or not dt_act: continue
+        
+        # 5. 🔥 決鬥：實交 > 預定 = 逾期
+        if dt_act > dt_sch:
+            delay_days = (dt_act - dt_sch).days
+            overdue_items.append({
+                "項目": title,
+                "預定": s_sch,
+                "實交": s_act,
+                "延遲": f"{delay_days}天"
+            })
+
+    # 如果有抓到逾期，統一發布異警
+    if overdue_items:
+        # 為了版面好看，我們只列出前 5 筆，剩下的用備註帶過
+        display_failures = []
+        for item in overdue_items[:5]:
+            display_failures.append({
+                "id": item['項目'], 
+                "val": f"{item['實交']} (晚於 {item['預定']})",
+                "calc": item['延遲']
+            })
+            
+        header_issues.append({
+            "page": "表頭", "item": "交貨時效", "issue_type": "⏰ 逾期交貨",
+            "common_reason": f"發現 {len(overdue_items)} 筆項目 實交晚於預定",
+            "failures": display_failures, 
+            "source": "🐍 表頭稽核(逐行)"
+        })
+
+    # --- 4. 工令格式檢查 (這還是看 Header Info) ---
+    h_info = ai_res_json.get("header_info", {})
+    ai_job = str(h_info.get("job_no", "Unknown"))
+    
     if ai_job and ai_job != "Unknown":
         clean_job = ai_job.upper().replace(" ", "").replace("-", "")
         if not re.match(r"^[WROY][A-Z0-9]{9}$", clean_job):
@@ -1757,33 +1816,6 @@ def python_header_audit_batch(photo_gallery, ai_res_json):
                 "failures": [{"id": "識別值", "val": ai_job}],
                 "source": "🐍 表頭稽核(AI)"
             })
-
-    # 逾期檢查
-    d_sch = str(h_info.get("scheduled_date", "Unknown"))
-    d_act = str(h_info.get("actual_date", "Unknown"))
-    
-    if d_sch != "Unknown" and d_act != "Unknown":
-        try:
-            # 支援 Excel 可能產生的不同分隔符
-            d_sch_clean = d_sch.replace("-", "/").replace(".", "/")
-            d_act_clean = d_act.replace("-", "/").replace(".", "/")
-            
-            # 有時候 Excel 讀進來會變成 "2025-01-01 00:00:00"，要切掉時間
-            if " " in d_sch_clean: d_sch_clean = d_sch_clean.split(" ")[0]
-            if " " in d_act_clean: d_act_clean = d_act_clean.split(" ")[0]
-            
-            dt_sch = datetime.strptime(d_sch_clean, "%Y/%m/%d")
-            dt_act = datetime.strptime(d_act_clean, "%Y/%m/%d")
-            
-            if dt_act > dt_sch:
-                 header_issues.append({
-                    "page": "表頭", "item": "交貨時效", "issue_type": "⏰ 逾期交貨",
-                    "common_reason": f"實際 {d_act} 晚於 預定 {d_sch}",
-                    "failures": [{"id": "延遲天數", "val": f"{(dt_act - dt_sch).days} 天"}], 
-                    "source": "🐍 表頭稽核(AI)"
-                })
-        except:
-            pass 
 
     return header_issues
     
