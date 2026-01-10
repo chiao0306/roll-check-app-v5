@@ -1768,28 +1768,23 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-    # --- 情況 C: 上傳 Excel (最終防呆版：防無限迴圈 + 支援重傳更新) ---
+    # --- 情況 C: 上傳 Excel (最終增強版 v3：支援千分位逗號與全形單位) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式」：已強化標題解析，支援 KG (熱處理) 與 in2 (研磨/動平衡) 單位提取。")
+        st.info("💡 使用「精準座標直讀模式」：已強化數值解析，支援千分位逗號 (e.g. 11,074) 與全形單位。")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
-            # --- 🔥 關鍵修正：防止無限迴圈 🔥 ---
-            # 我們初始化一個變數來記住「上一次處理的是哪個檔案物件」
+            # --- 防止無限迴圈檢查 ---
             if 'last_uploaded_object' not in st.session_state:
                 st.session_state.last_uploaded_object = None
 
-            # 只有當「現在上傳的物件」跟「上次處理的物件」不一樣時，才執行解析
-            # Streamlit 特性：就算檔名一樣，只要你重新拖拉上傳，物件 ID 就會變，這裡就會是 True
             if uploaded_xlsx != st.session_state.last_uploaded_object:
                 
                 try:
-                    # 1. 鎖定這個物件，避免下一圈 rerun 又跑進來
                     st.session_state.last_uploaded_object = uploaded_xlsx
-                    
                     current_file_name = uploaded_xlsx.name
                     
-                    # 2. 讀取 Excel (強制轉字串)
+                    # 1. 讀取 Excel
                     df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None, header=None, dtype=str)
                     
                     st.session_state.source_mode = 'excel'
@@ -1829,14 +1824,12 @@ with st.container(border=True):
                             while len(row) < 15: row.append("")
 
                             # =================================================
-                            # 1. 狀態切換偵測
+                            # 1. 狀態切換
                             # =================================================
-                            
                             if KEY_PAGE_START in row_str:
                                 current_zone = "HEADER"
                                 continue
 
-                            # 明細觸發
                             if "編號" in str(row[3]) and "尺寸" in str(row[5]):
                                 current_zone = "DETAIL"
                                 continue 
@@ -1848,9 +1841,8 @@ with st.container(border=True):
                                 continue
 
                             # =================================================
-                            # 2. 區域處理邏輯
+                            # 2. 區域處理
                             # =================================================
-                            
                             if current_zone == "HEADER":
                                 if "工令" in col_a:
                                     job_val = str(row[1]).strip()
@@ -1860,7 +1852,7 @@ with st.container(border=True):
                                         if m: job_val = m.group(1)
                                     if len(job_val) >= 10 and job_val[0] in ['W', 'R', 'O', 'Y']:
                                         fake_ai_result["header_info"]["job_no"] = job_val
-                                        
+                                    
                                 if KEY_SUMMARY_ANCHOR in row_str:
                                     current_zone = "SUMMARY"
                                     summary_header_row_idx = r_idx
@@ -1897,11 +1889,10 @@ with st.container(border=True):
                             elif current_zone == "DETAIL":
                                 if col_a:
                                     if expecting_spec:
-                                        # 這是規格
                                         if active_item: active_item["std_spec"] = col_a
                                         expecting_spec = False 
                                     else:
-                                        # --- 這是新項目 ---
+                                        # --- 🔥 這是新項目 (強化解析) ---
                                         import re
                                         
                                         # 1. 解析 item_pc_target
@@ -1914,7 +1905,12 @@ with st.container(border=True):
                                         batch_qty = 0
                                         batch_keywords = ["熱處理", "研磨", "動平衡"]
                                         if any(k in col_a for k in batch_keywords):
-                                            m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(?:KG|in2)", col_a, re.IGNORECASE)
+                                            # 🔥 步驟 A：預處理，移除逗號，全形轉半形
+                                            clean_text = col_a.replace(",", "").upper() # 轉大寫、去逗號
+                                            clean_text = clean_text.replace("ＫＧ", "KG").replace("ＩＮ２", "IN2")
+                                            
+                                            # 🔥 步驟 B：正規表達式抓取 (支援小數點)
+                                            m_qty = re.search(r"(\d+(?:\.\d+)?)\s*(?:KG|IN2)", clean_text)
                                             if m_qty:
                                                 batch_qty = float(m_qty.group(1))
 
@@ -1923,7 +1919,7 @@ with st.container(border=True):
                                             "item_title": col_a,
                                             "std_spec": "",
                                             "item_pc_target": target,      
-                                            "batch_total_qty": batch_qty,
+                                            "batch_total_qty": batch_qty,  # ✅ 修正完成
                                             "category": None,
                                             "ds": ""
                                         }
@@ -1932,7 +1928,6 @@ with st.container(border=True):
                                 else:
                                     pass 
                                 
-                                # 讀取右邊網格
                                 if active_item:
                                     right_part = row[1:]
                                     valid_cells = [x.strip() for x in right_part if x.strip()]
@@ -1960,7 +1955,6 @@ with st.container(border=True):
                             'real_page': sheet_name
                         })
 
-                    # 存入 Cache
                     st.session_state.analysis_result_cache = {
                         "job_no": fake_ai_result["header_info"].get("job_no", "Unknown"),
                         "header_info": fake_ai_result["header_info"],
@@ -1971,7 +1965,7 @@ with st.container(border=True):
                         "total_duration": 0.5, "ocr_duration": 0, "ai_duration": 0, "py_duration": 0,
                         "cost_twd": 0, "total_in": 0, "total_out": 0,
                         "ai_extracted_data": fake_ai_result["dimension_data"],
-                        "combined_input": "Excel Direct Read (v7 Anti-Loop)"
+                        "combined_input": "Excel Direct Read (v8 Num-Fix)"
                     }
                     
                     st.toast(f"✅ Excel 解析完成: {current_file_name}", icon="⚡")
@@ -1984,7 +1978,6 @@ with st.container(border=True):
                     st.error(f"Excel 解析失敗: {e}")
             
             else:
-                # 如果物件沒變 (代表只是畫面刷新，沒有重新上傳)，就什麼都不做，直接顯示舊結果
                 if st.session_state.get('last_loaded_xlsx_name'):
                     st.success(f"📊 目前載入 Excel：**{st.session_state.last_loaded_xlsx_name}**")
 
