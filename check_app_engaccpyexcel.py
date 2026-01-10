@@ -1775,13 +1775,12 @@ with st.container(border=True):
             except Exception as e:
                 st.error(f"JSON 檔案格式錯誤: {e}")
 
-    # --- 情況 C: 上傳 Excel (最終增強版 v4：右側欄位數值搜尋) ---
+    # --- 情況 C: 上傳 Excel (最終完美版 v5：真實頁碼提取) ---
     elif data_source == "📊 上傳 Excel 檔":
-        st.info("💡 使用「精準座標直讀模式」：已修正 Batch Qty 抓取邏輯，自動搜尋標題右側數據。")
+        st.info("💡 使用「精準座標直讀模式」：已修正頁碼顯示，將從表頭提取真實頁數 (e.g. 1/7)。")
         uploaded_xlsx = st.file_uploader("上傳 Excel 檔", type=['xlsx', 'xls', 'xlsm'], key="xlsx_uploader")
         
         if uploaded_xlsx:
-            # 防無限迴圈
             if 'last_uploaded_object' not in st.session_state:
                 st.session_state.last_uploaded_object = None
 
@@ -1791,7 +1790,6 @@ with st.container(border=True):
                     st.session_state.last_uploaded_object = uploaded_xlsx
                     current_file_name = uploaded_xlsx.name
                     
-                    # 1. 讀取 Excel
                     df_dict = pd.read_excel(uploaded_xlsx, sheet_name=None, header=None, dtype=str)
                     
                     st.session_state.source_mode = 'excel'
@@ -1806,19 +1804,23 @@ with st.container(border=True):
                         "_token_usage": {"input": 0, "output": 0}
                     }
 
-                    # --- 關鍵字定義 ---
                     KEY_PAGE_START = "工件檢驗紀錄單"
                     KEY_SUMMARY_ANCHOR = "名稱及規範"
                     KEY_STOP_SIGN = "注意事項"
 
-                    # 狀態變數
                     current_zone = "SEARCHING" 
                     active_item = None
                     expecting_spec = False
-                    summary_header_row_idx = -1 
+                    summary_header_row_idx = -1
+                    
+                    # 🔥 新增：當前頁碼變數
+                    current_page_num = "1" 
 
                     for sheet_name, df in df_dict.items():
-                        # 清洗數據
+                        # 每個分頁開始前，先預設頁碼為 Sheet Name (防呆)
+                        # 但通常第一行讀到 header 就會更新
+                        current_page_num = sheet_name 
+                        
                         df = df.fillna("").astype(str)
                         df = df.replace(r'\n', '', regex=True).replace(r'\r', '', regex=True)
                         df = df.replace('nan', '', regex=False)
@@ -1835,6 +1837,20 @@ with st.container(border=True):
                             # =================================================
                             if KEY_PAGE_START in row_str:
                                 current_zone = "HEADER"
+                                
+                                # 🔥 修改重點：抓取真實頁碼
+                                # 尋找 "項次: 1 / 7" 或 "項次:1/7" 的格式
+                                import re
+                                # 抓取冒號後面的數字，直到遇到斜線
+                                m_page = re.search(r"項次[:：]\s*(\d+)\s*[/／]", row_str)
+                                if m_page:
+                                    current_page_num = m_page.group(1) # 提取數字 "1"
+                                else:
+                                    # 備援：有些表單可能只寫 "Page 1"
+                                    m_page_alt = re.search(r"Page[:：]?\s*(\d+)", row_str, re.IGNORECASE)
+                                    if m_page_alt:
+                                        current_page_num = m_page_alt.group(1)
+                                
                                 continue
 
                             if "編號" in str(row[3]) and "尺寸" in str(row[5]):
@@ -1854,7 +1870,6 @@ with st.container(border=True):
                                 if "工令" in col_a:
                                     job_val = str(row[1]).strip()
                                     if not job_val:
-                                        import re
                                         m = re.search(r"([WROY][A-Z0-9]{9})", col_a.replace(" ","").replace("-",""))
                                         if m: job_val = m.group(1)
                                     if len(job_val) >= 10 and job_val[0] in ['W', 'R', 'O', 'Y']:
@@ -1880,7 +1895,7 @@ with st.container(border=True):
                                         a_date = str(row[12]).strip()
                                         
                                         fake_ai_result["summary_rows"].append({
-                                            "page": sheet_name,
+                                            "page": current_page_num, # 🔥 使用抓到的頁碼
                                             "title": title_val,
                                             "apply_qty": safe_float(row[3]),
                                             "delivery_qty": safe_float(row[5]),
@@ -1899,40 +1914,31 @@ with st.container(border=True):
                                         if active_item: active_item["std_spec"] = col_a
                                         expecting_spec = False 
                                     else:
-                                        # --- 🔥 這是新項目 ---
+                                        # New Item
                                         import re
-                                        
-                                        # 1. 解析 item_pc_target
                                         target = 0
                                         matches = re.findall(r"[（(](\d+)[A-Za-z\s]*[)）]", col_a)
-                                        if matches:
-                                            target = int(matches[-1])
+                                        if matches: target = int(matches[-1])
                                         
-                                        # 2. 解析 batch_total_qty (向右搜尋)
                                         batch_qty = 0
-                                        batch_keywords = ["熱處理", "輥輪研磨", "動平衡"]
+                                        batch_keywords = ["熱處理", "研磨", "動平衡"]
                                         if any(k in col_a for k in batch_keywords):
-                                            # 往右找第一個非空格子
                                             target_cell_val = ""
-                                            for cell in row[1:]: # 從 B 欄開始往右
-                                                if cell.strip(): # 找到有字的格子
+                                            for cell in row[1:]:
+                                                if cell.strip():
                                                     target_cell_val = cell.strip()
                                                     break
-                                            
-                                            # 如果找到了，解析數字 (支援逗號、小數點)
                                             if target_cell_val:
                                                 clean_text = target_cell_val.replace(",", "").upper()
-                                                # 寬容匹配：只要有數字就抓，不管是純數字還是帶單位
                                                 m_qty = re.search(r"(\d+(?:\.\d+)?)", clean_text)
-                                                if m_qty:
-                                                    batch_qty = float(m_qty.group(1))
+                                                if m_qty: batch_qty = float(m_qty.group(1))
 
                                         active_item = {
-                                            "page": sheet_name,
+                                            "page": current_page_num, # 🔥 使用抓到的頁碼
                                             "item_title": col_a,
                                             "std_spec": "",
                                             "item_pc_target": target,      
-                                            "batch_total_qty": batch_qty,  # ✅ 更新：抓取右側欄位
+                                            "batch_total_qty": batch_qty,
                                             "category": None,
                                             "ds": ""
                                         }
@@ -1941,7 +1947,6 @@ with st.container(border=True):
                                 else:
                                     pass 
                                 
-                                # 讀取右邊網格
                                 if active_item:
                                     right_part = row[1:]
                                     valid_cells = [x.strip() for x in right_part if x.strip()]
@@ -1950,10 +1955,6 @@ with st.container(border=True):
                                         rid = valid_cells[i]
                                         val = valid_cells[i+1]
                                         if rid and val:
-                                            # 避免把剛剛抓到的 Batch Qty (例如 "11074 KG") 當成 ID 讀進去
-                                            # 簡單過濾：如果 rid 看起來像 Batch Qty 且沒有對應的 Value (或是 Value 也是數字)，可能要小心
-                                            # 但通常 Batch Qty 的右邊是空的，所以 pairs 迴圈會因為長度不足或 val 為空而跳過
-                                            # 這裡保持原邏輯即可，除非 Batch Qty 後面緊接著另一個數字
                                             if "編號" not in rid and "尺寸" not in val:
                                                 pairs.append(f"{rid}:{val}")
                                     
@@ -1983,7 +1984,7 @@ with st.container(border=True):
                         "total_duration": 0.5, "ocr_duration": 0, "ai_duration": 0, "py_duration": 0,
                         "cost_twd": 0, "total_in": 0, "total_out": 0,
                         "ai_extracted_data": fake_ai_result["dimension_data"],
-                        "combined_input": "Excel Direct Read (v9 Right-Search)"
+                        "combined_input": "Excel Direct Read (v10 Page-Fix)"
                     }
                     
                     st.toast(f"✅ Excel 解析完成: {current_file_name}", icon="⚡")
