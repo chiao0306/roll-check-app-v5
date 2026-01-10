@@ -572,12 +572,11 @@ def merge_ai_results(results_list):
 
 def assign_category_by_python(item_title):
     """
-    Python 分類官 (v71: 三位一體完全版)
+    Python 分類官 (v72: 防彈背心版)
     整合內容：
-    1. [強力清洗]: 支援全形符號 (＝, ×, ＋) 轉半形，解決 OCR 識別問題。
-    2. [冷酷正宮]: 導入 v71 邏輯，若 Excel 有完全匹配項目(含規則為空者)，絕對禁止模糊匹配。
-       - 避免 "正宮沒填規則，卻誤抓小三規則" 的情況。
-    3. [防暴食]: 保留 v2 去尾邏輯，保護 (1SET=4PCS) 結構。
+    1. [防護]: 🔥 全面加裝 safe_str，防止 Excel NaN/None 造成崩潰。
+    2. [清洗]: 支援全形轉半形 (＝, ×, ＋)。
+    3. [邏輯]: 繼承 v71 冷酷正宮邏輯 (完全匹配優先)。
     """
     import pandas as pd
     from thefuzz import fuzz
@@ -586,30 +585,40 @@ def assign_category_by_python(item_title):
     # 1. 讀取全域門檻
     CURRENT_THRESHOLD = globals().get('GLOBAL_FUZZ_THRESHOLD', 90)
 
-    # 🔥 [修正] 智能去尾函式 (v2: 防暴食版)
-    def remove_tail_info(text):
-        # [^\(（]*? 代表「括號內容不能包含其他的左括號」
-        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", str(text)).strip()
+    # 🔥 [新增] 防彈衣小幫手
+    def safe_str(val):
+        if val is None: return ""
+        s = str(val).strip()
+        # 把 Excel 常見的空值代號洗成真正的空字串
+        if s.lower() in ['nan', 'none', 'null']: return ""
+        return s
 
-    # 🔥 [升級] 強力清洗函式 (v36: 符號轉半形版)
+    # 智能去尾 (加上 safe_str)
+    def remove_tail_info(text):
+        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", safe_str(text)).strip()
+
+    # 強力清洗 (加上 safe_str)
     def clean_text(text):
-        t = str(text).upper() # 強制大寫
+        t = safe_str(text).upper() # 強制轉字串並大寫
         # 符號統一 (全形轉半形)
         t = t.replace("（", "(").replace("）", ")")
         t = t.replace("＝", "=").replace("＋", "+").replace("－", "-")
-        t = t.replace("×", "X").replace("＊", "X") # 乘號轉 X
+        t = t.replace("×", "X").replace("＊", "X")
         t = t.replace("＃", "#").replace("：", ":")
         # 清雜訊
         return t.replace(" ", "").replace("\n", "").replace("\r", "").replace('"', '').replace("'", "").strip()
 
     # 🔥 [關鍵步驟] 先做去尾手術，再做強力清理
+    # 如果 item_title 原本是 None，這裡會安全地變成 ""
     title_no_tail = remove_tail_info(item_title)
-    
-    # 用「去尾+清洗」後的乾淨字串來做比對鍵值 (Phase 2 用)
     title_clean = clean_text(title_no_tail)
     
+    # 🔥 [效能優化] 如果清洗完是空的 (代表原本是 NaN 或空白)，直接下班
+    if not title_clean:
+        return "unknown"
+    
     # 原始大寫檢查用 (Phase 1 & 3 用)
-    t_upper = str(item_title).upper().replace(" ", "").replace("\n", "").replace('"', "")
+    t_upper = safe_str(item_title).upper().replace(" ", "").replace("\n", "").replace('"', "")
 
     # ==========================================
     # ⚡️ Phase 1: 絕對豁免
@@ -628,31 +637,27 @@ def assign_category_by_python(item_title):
         forced_rule = None
         found_exact = False # 🚩 正宮旗標
 
-        # 1. 建立搜尋清單 (先轉成字典以利快速查找)
+        # 1. 建立搜尋清單
         rules_db = {}
         for _, row in df.iterrows():
-            iname = str(row.get('Item_Name', '')).strip()
-            rule_cat = str(row.get('Category_Rule', '')).strip()
-            if rule_cat.lower() == 'nan': rule_cat = "" # 轉成空字串，方便後續判斷
+            # 🔥 這裡使用 safe_str 讀取，避免 NaN 變成 "nan" 字串
+            iname = safe_str(row.get('Item_Name'))
+            rule_cat = safe_str(row.get('Category_Rule'))
             
             if iname:
-                # Key 值也要用強力清洗版
                 key = clean_text(iname)
                 rules_db[key] = rule_cat
 
         # 2. 檢查完全匹配 (正宮檢查)
         if title_clean in rules_db:
-            found_exact = True # 找到了！無論規則是不是空的，都算找到
+            found_exact = True 
             forced_rule = rules_db[title_clean]
-            
-            # 如果規則是空的，代表 User 故意留白，意思是「不要用特規，回歸一般邏輯」
-            # 此時 forced_rule = ""，後面的 if forced_rule 判斷會跳過，直接進入 Phase 3
-            # 這是正確的！因為找到了正宮，所以我們「不跑模糊匹配」，直接往下走。
+            # 若 forced_rule 為空，代表故意留白回歸一般邏輯，正確。
 
         # 3. 檢查模糊匹配 (只在沒找到正宮時執行)
         if not found_exact and rules_db:
             for k, v in rules_db.items():
-                if not v: continue # 如果規則是空的，模糊匹配抓到也沒用，跳過
+                if not v: continue # 規則為空跳過
                 
                 score = fuzz.token_sort_ratio(k, title_clean)
                 if score > CURRENT_THRESHOLD: 
@@ -677,27 +682,24 @@ def assign_category_by_python(item_title):
     # ==========================================
     # ⚡️ Phase 3: 關鍵字補底 (黃金順序)
     # ==========================================
-    # 走到這裡代表：
-    # 1. Excel 裡完全沒這個項目
-    # 2. Excel 裡有這個項目(正宮)，但 Category_Rule 是空的 -> 回歸一般判斷
 
-    # 1. [內孔] 特例：優先權最高 -> range
+    # 1. [內孔] 特例
     if "內孔" in t_upper:
         return "range"
 
-    # 2. [焊補]：優先於軸頸 -> min_limit
+    # 2. [焊補]
     has_weld = any(k in t_upper for k in ["銲補", "銲接", "焊", "WELD", "鉀"])
     if has_weld:
         return "min_limit"
 
-    # 3. [未再生]：區分本體與軸頸
+    # 3. [未再生]
     has_unregen = any(k in t_upper for k in ["未再生", "UN_REGEN", "粗車"])
     if has_unregen:
         if any(k in t_upper for k in ["軸頸", "軸頭", "軸位", "JOURNAL"]): 
             return "max_limit"
         return "un_regen"
 
-    # 4. [再生/精加工]：(移除了 "車修") -> range
+    # 4. [再生/精加工]
     has_regen = any(k in t_upper for k in ["再生", "研磨", "精加工", "KEYWAY", "GRIND", "MACHIN", "精車", "組裝", "拆裝", "裝配", "ASSY", "配磨"])
     if has_regen:
         return "range"
