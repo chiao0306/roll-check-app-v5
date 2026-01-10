@@ -951,11 +951,10 @@ def python_numerical_audit(dimension_data):
     
 def python_accounting_audit(dimension_data, res_main):
     """
-    Python 會計官 (v72: 究極完全體)
+    Python 會計官 (v73: 防彈背心版)
     整合內容：
-    1. [核心]: 繼承 v71「冷酷正宮」邏輯，強制完全匹配優先，杜絕亂認親戚。
-    2. [匯總]: 完整支援 Mode A/B/AB、運費計算、Agg 免疫機制。
-    3. [補強]: 新增「反向稽核」，偵測未被總表認領的幽靈明細 (漏列帳偵測)。
+    1. [防護]: 🔥 全面加裝 safe_str，防止 Excel 的 NaN/None 造成崩潰或邏輯誤判。
+    2. [核心]: 繼承 v72 邏輯 (正宮優先、Mode A/B、反向稽核)。
     """
     accounting_issues = []
     from thefuzz import fuzz
@@ -966,13 +965,21 @@ def python_accounting_audit(dimension_data, res_main):
     # --- 0. 設定 ---
     CURRENT_THRESHOLD = globals().get('GLOBAL_FUZZ_THRESHOLD', 90)
 
-    # 智能去尾 (v2 防暴食)
-    def remove_tail_info(text):
-        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", str(text)).strip()
+    # 🔥 [修正 1] 新增防彈衣函式
+    def safe_str(val):
+        if val is None: return ""
+        s = str(val).strip()
+        # 清洗 Excel 常見的空值代號
+        if s.lower() in ['nan', 'none', 'null']: return ""
+        return s
 
-    # 強力清洗 (v36 包含符號轉半形)
+    # 智能去尾 (加上 safe_str)
+    def remove_tail_info(text):
+        return re.sub(r"[\(（][^\(（]*?[\)）]\s*$", "", safe_str(text)).strip()
+
+    # 強力清洗 (加上 safe_str)
     def clean_text(text):
-        t = str(text).replace("（", "(").replace("）", ")")
+        t = safe_str(text).replace("（", "(").replace("）", ")")
         t = t.replace("＝", "=").replace("＋", "+").replace("－", "-") 
         return t.replace(" ", "").replace("\n", "").replace("\r", "").replace('"', '').replace("'", "").strip()
 
@@ -984,12 +991,14 @@ def python_accounting_audit(dimension_data, res_main):
         except: return 0.0
 
     def parse_ratio(rule_str):
-        if not rule_str or pd.isna(rule_str) or str(rule_str).strip() == "": return 1.0
-        match = re.search(r"(\d+)\s*/\s*(\d+)", str(rule_str))
+        # 這裡也加上 safe_str 防護
+        s = safe_str(rule_str)
+        if not s: return 1.0
+        match = re.search(r"(\d+)\s*/\s*(\d+)", s)
         if match:
             n, d = float(match.group(1)), float(match.group(2))
             if d != 0: return n / d
-        try: return float(rule_str)
+        try: return float(s)
         except: return 1.0
 
     # --- 1. 載入規則 ---
@@ -998,15 +1007,15 @@ def python_accounting_audit(dimension_data, res_main):
         df = pd.read_excel("rules.xlsx")
         df.columns = [c.strip() for c in df.columns]
         for _, row in df.iterrows():
-            iname = str(row.get('Item_Name', '')).strip()
+            # 🔥 [修正 2] 讀取時直接清洗，代碼更簡潔且安全
+            iname = safe_str(row.get('Item_Name'))
             if iname: 
                 key = clean_text(iname)
-                u_loc = str(row.get('Unit_Rule_Local', ''))
-                if u_loc == 'nan': u_loc = ""
-                u_fr = str(row.get('Unit_Rule_Freight', ''))
-                if u_fr == 'nan': u_fr = ""
-                u_agg = str(row.get('Unit_Rule_Agg', ''))
-                if u_agg == 'nan': u_agg = ""
+                
+                # 直接讀取並清洗，不用再手寫 if 'nan' ...
+                u_loc = safe_str(row.get('Unit_Rule_Local'))
+                u_fr = safe_str(row.get('Unit_Rule_Freight'))
+                u_agg = safe_str(row.get('Unit_Rule_Agg'))
 
                 rules_map[key] = {
                     "u_local": u_loc,
@@ -1018,7 +1027,7 @@ def python_accounting_audit(dimension_data, res_main):
     summary_rows = res_main.get("summary_rows", [])
     rule_hits_log = {} 
     
-    # 🔥 [新增] 簽到表：記錄哪些明細被總表認領了
+    # 簽到表
     matched_detail_indices = set()
 
     # =================================================
@@ -1026,7 +1035,7 @@ def python_accounting_audit(dimension_data, res_main):
     # =================================================
     global_sum_tracker = {}
     for s in summary_rows:
-        s_title = s.get('title', 'Unknown')
+        s_title = safe_str(s.get('title', 'Unknown')) # 🔥 加上防護
         q_apply = safe_float(s.get('apply_qty', 0))      
         q_deliver = safe_float(s.get('delivery_qty', 0)) 
         if q_deliver == 0 and 'target' in s: q_deliver = safe_float(s.get('target', 0))
@@ -1056,10 +1065,13 @@ def python_accounting_audit(dimension_data, res_main):
     # =================================================
     # 🕵️‍♂️ 第二關：逐項掃描 (總表撈明細)
     # =================================================
-    # 🔥 修改迴圈方式：改用 enumerate 取得 d_idx，以便簽到
     for d_idx, item in enumerate(dimension_data):
-        raw_title = item.get("item_title", "")
+        # 🔥 [修正 3] 讀取欄位全面加上 safe_str
+        raw_title = safe_str(item.get("item_title"))
         
+        # 如果標題是空的 (例如 Excel 空行)，直接跳過，避免浪費資源
+        if not raw_title: continue 
+
         # 準備匹配用的標題
         title_no_tail = remove_tail_info(raw_title)
         title_clean_rule = clean_text(title_no_tail) 
@@ -1069,14 +1081,14 @@ def python_accounting_audit(dimension_data, res_main):
         target_pc = safe_float(item.get("item_pc_target", 0)) 
         batch_qty = safe_float(item.get("batch_total_qty", 0))
         
-        # 2.1 規則匹配 (正宮優先邏輯)
+        # 2.1 規則匹配 (正宮優先邏輯 - 維持不變)
         rule_set = None
         matched_rule_name = None
         match_type = ""
         match_score = 0
         found_exact = False
 
-        # A. 完全匹配 (優先用去尾後的乾淨字串)
+        # A. 完全匹配
         if title_clean_rule in rules_map:
             rule_set = rules_map[title_clean_rule]
             matched_rule_name = title_clean_rule
@@ -1084,7 +1096,7 @@ def python_accounting_audit(dimension_data, res_main):
             match_score = 100
             found_exact = True 
         
-        # B. 完整匹配 (如果去尾失敗，試試看沒去尾的)
+        # B. 完整匹配
         if not found_exact and title_clean_full in rules_map:
             rule_set = rules_map[title_clean_full]
             matched_rule_name = title_clean_full
@@ -1092,7 +1104,7 @@ def python_accounting_audit(dimension_data, res_main):
             match_score = 100
             found_exact = True 
 
-        # C. 模糊匹配 (只有在沒找到正宮時才執行)
+        # C. 模糊匹配
         if not found_exact and rules_map:
             best_score = 0
             best_rule = None
@@ -1119,13 +1131,13 @@ def python_accounting_audit(dimension_data, res_main):
         u_fr = rule_set.get("u_fr", "") if rule_set else ""
         u_agg = rule_set.get("u_agg", "") if rule_set else ""
         
-        ds = str(item.get("ds", ""))
+        ds = safe_str(item.get("ds")) # 🔥 這裡也加了防護
         data_list = [pair.split(":") for pair in ds.split("|") if ":" in pair]
         raw_count = len(data_list) if data_list else 0
-        id_counts = Counter([str(e[0]).strip() for e in data_list if len(e)>0])
+        id_counts = Counter([safe_str(e[0]) for e in data_list if len(e)>0]) # id 也稍微洗一下
 
         # A. 單項檢查
-        is_local_exempt = "豁免" in str(u_local) or "SKIP" in str(u_local).upper() or "EXEMPT" in str(u_local).upper()
+        is_local_exempt = "豁免" in u_local or "SKIP" in u_local.upper() or "EXEMPT" in u_local.upper()
         ratio = parse_ratio(u_local)
         actual_item_qty = raw_count if batch_qty > 0 else raw_count * ratio
         
@@ -1149,9 +1161,9 @@ def python_accounting_audit(dimension_data, res_main):
         fr_multiplier = parse_ratio(u_fr)
         freight_val = 0.0
         f_note = ""
-        u_fr_upper = str(u_fr).upper()
+        u_fr_upper = u_fr.upper()
         is_fr_exempt = "豁免" in u_fr_upper or "SKIP" in u_fr_upper
-        is_forced_include = "計入" in str(u_fr) or "INCLUDED" in u_fr_upper
+        is_forced_include = "計入" in u_fr or "INCLUDED" in u_fr_upper
         is_default_target = ("本體" in title_clean_full and "未再生" in title_clean_full) or ("新品組裝" in title_clean_full)
         
         if not is_fr_exempt and (is_default_target or is_forced_include or fr_multiplier != 1.0):
@@ -1163,7 +1175,7 @@ def python_accounting_audit(dimension_data, res_main):
         # =================================================
         agg_mode = "B" 
         if u_agg:
-            p_clean = str(u_agg).upper().replace(" ", "")
+            p_clean = u_agg.upper().replace(" ", "")
             if p_clean == "NAN": agg_mode = "B"
             elif "EXEMPT" in p_clean or "SKIP" in p_clean: agg_mode = "EXEMPT"
             elif "AB" in p_clean: agg_mode = "AB"
@@ -1181,9 +1193,6 @@ def python_accounting_audit(dimension_data, res_main):
                     if freight_val > 0:
                         data["actual"] += freight_val
                         data["details"].append({"page": page, "title": raw_title, "val": freight_val, "note": f"運費 {f_note}"})
-                        # 運費通常不視為「認領」了該明細的全部，所以這裡暫不簽到，或者看您需求
-                        # 如果運費算是這個明細的歸宿，可以加 matched_detail_indices.add(d_idx)
-                        # 但通常一個明細會有主歸戶，運費只是附加，所以這裡先不簽到，等主歸戶簽到。
                     continue
 
                 # 🧺 步驟 1: 籃子撈人
@@ -1267,11 +1276,10 @@ def python_accounting_audit(dimension_data, res_main):
                     c_msg = f"x{agg_multiplier}" if agg_multiplier != 1.0 else ""
                     data["details"].append({"page": page, "title": raw_title, "val": qty_agg, "note": c_msg})
                     
-                    # 🔥 [簽到] 這個明細已被此籃子認領
                     matched_detail_indices.add(d_idx)
 
     # =================================================
-    # 🕵️‍♂️ 第三關：明細總結算 (Loop 3)
+    # 🕵️‍♂️ 第三關：明細總結算
     # =================================================
     for s_title, data in global_sum_tracker.items():
         if abs(data["actual"] - data["target"]) > 0.01: 
@@ -1300,13 +1308,13 @@ def python_accounting_audit(dimension_data, res_main):
             })
 
     # ========================================================
-    # 🕵️‍♂️ 第四關：反向稽核 (抓幽靈明細) 🔥 [新增]
+    # 🕵️‍♂️ 第四關：反向稽核 (抓幽靈明細)
     # ========================================================
     for d_idx, item in enumerate(dimension_data):
         if d_idx not in matched_detail_indices:
             
-            # 過濾雜訊：如果是備註、空行或極短標題，通常不是正文
-            raw_t = item.get("item_title", "")
+            # 🔥 [修正 4] 使用 safe_str，並判斷若標題為空(原始為NaN)則不視為幽靈
+            raw_t = safe_str(item.get("item_title"))
             if not raw_t or "備註" in raw_t or len(raw_t) < 2: 
                 continue
 
@@ -1320,11 +1328,11 @@ def python_accounting_audit(dimension_data, res_main):
             })
 
     # ========================================================
-    # 步驟 5: 成績單回寫 (Write-Back)
+    # 步驟 5: 成績單回寫
     # ========================================================
     if res_main and "summary_rows" in res_main:
         for row in res_main["summary_rows"]:
-            t = row.get('title', '')
+            t = safe_str(row.get('title'))
             if t in global_sum_tracker:
                 info = global_sum_tracker[t]
                 if info['actual'] > 0:
@@ -1337,7 +1345,6 @@ def python_accounting_audit(dimension_data, res_main):
                 row['_audit_status'] = "🔴 異常" if abs(info["actual"] - info["target"]) > 0.01 else "🟢 合格"
                 row['_audit_note'] = info.get('b_reason', '') 
 
-    # HIDDEN_DATA 處理
     if rule_hits_log:
         accounting_issues.append({
             "issue_type": "HIDDEN_DATA",
@@ -1346,7 +1353,7 @@ def python_accounting_audit(dimension_data, res_main):
         })
             
     return accounting_issues
-    
+
 def python_process_audit(dimension_data):
     """
     Python 流程引擎 (v73: 防彈背心版)
