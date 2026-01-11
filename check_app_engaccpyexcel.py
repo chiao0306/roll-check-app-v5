@@ -923,12 +923,20 @@ def python_numerical_audit(dimension_data):
                 else:
                     is_two_dec, is_pure_int = True, True 
 
-                if "min_limit" in l_type or "銲補" in (cat + title):
+                elif "min_limit" in l_type or "銲補" in (cat + title):
                     engine_label = "銲補"
                     if not is_pure_int: is_passed, reason = False, "應為純整數"
                     elif clean_std:
+                        # 找出最接近的那個標準值 (通常銲補只有一個標準，但防呆還是留著 min)
                         t_used = min(clean_std, key=lambda x: abs(x - val))
-                        if val < t_used: is_passed, reason = False, "數值不足"
+                        
+                        # 1. 檢查是否小於標準 (原本的邏輯)
+                        if val < t_used: 
+                            is_passed, reason = False, "數值不足"
+                        
+                        # 2. 🔥 [新增] 檢查是否大於 (標準 + 20)
+                        elif val > (t_used + 20):
+                            is_passed, reason = False, f"超過上限 (+20)"
                 
                 elif un_regen_target is not None:
                     engine_label = "未再生"
