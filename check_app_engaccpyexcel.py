@@ -1160,17 +1160,44 @@ def python_accounting_audit(dimension_data, res_main):
         raw_count = len(data_list) if data_list else 0
         id_counts = Counter([safe_str(e[0]) for e in data_list if len(e)>0]) # id 也稍微洗一下
 
-        # A. 單項檢查
-        is_local_exempt = "豁免" in u_local or "SKIP" in u_local.upper() or "EXEMPT" in u_local.upper()
+        # A. 單項檢查 (v74: 修正 Target=0 漏報問題 + 白名單豁免)
+        is_local_exempt = "豁免" in str(u_local) or "SKIP" in str(u_local).upper() or "EXEMPT" in str(u_local).upper()
         ratio = parse_ratio(u_local)
         actual_item_qty = raw_count if batch_qty > 0 else raw_count * ratio
         
-        if not is_local_exempt and abs(actual_item_qty - target_pc) > 0.01 and target_pc > 0:
-             accounting_issues.append({
-                 "page": page, "item": raw_title, "issue_type": "🛑 統計不符(單項)", 
-                 "common_reason": f"標題 {target_pc} != 內文 {actual_item_qty} (倍率:{ratio})", 
-                 "failures": [], "source": "🐍 會計引擎"
-             })
+        diff = abs(actual_item_qty - target_pc)
+        
+        # 條件：有差異 且 沒有被規則豁免
+        if not is_local_exempt and diff > 0.01:
+            
+            should_report = False
+            error_reason = ""
+
+            # 狀況 1: 正常設定了目標 (Target > 0)，但數量不符 -> 必報
+            if target_pc > 0:
+                should_report = True
+                error_reason = f"標題 {target_pc} != 內文 {actual_item_qty} (倍率:{ratio})"
+
+            # 狀況 2: 沒設定目標 (Target == 0)，但竟然有內文 (Actual > 0) -> 這是您要抓的漏寫！
+            elif target_pc == 0 and actual_item_qty > 0:
+                # 🛡️ 白名單豁免：這些項目本來就不會寫 (1SET=4PCS)，Target=0 是正常的
+                # 這裡檢查 raw_title 是否包含關鍵字
+                t_check = str(raw_title).upper()
+                keywords_whitelist = ["熱處理", "動平衡", "輥輪研磨"] 
+                
+                is_batch_exempt = any(k in t_check for k in keywords_whitelist)
+                
+                # 如果不在白名單內，就要報錯
+                if not is_batch_exempt:
+                    should_report = True
+                    error_reason = f"⚠️ 未設定目標數量 (Target=0) 但偵測到內文 ({actual_item_qty})"
+
+            if should_report:
+                 accounting_issues.append({
+                     "page": page, "item": raw_title, "issue_type": "🛑 統計不符(單項)", 
+                     "common_reason": error_reason, 
+                     "failures": [], "source": "🐍 會計引擎"
+                 })
 
         # B. 重複檢查
         journal_family = ["軸頸", "軸頭", "軸位", "內孔", "JOURNAL"]
