@@ -923,7 +923,7 @@ def python_numerical_audit(dimension_data):
                 else:
                     is_two_dec, is_pure_int = True, True 
 
-                elif "min_limit" in l_type or "銲補" in (cat + title):
+                if "min_limit" in l_type or "銲補" in (cat + title):
                     engine_label = "銲補"
                     if not is_pure_int: is_passed, reason = False, "應為純整數"
                     elif clean_std:
